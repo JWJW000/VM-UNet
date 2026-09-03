@@ -14,26 +14,32 @@ from PIL import Image
 
 
 class NPY_datasets(Dataset):
-    def __init__(self, path_Data, config, train=True):
+    def __init__(self, path_Data, config, train=True, file_list=None):
         super(NPY_datasets, self)
         if train:
-            images_list = sorted(os.listdir(path_Data+'train/images/'))
-            masks_list = sorted(os.listdir(path_Data+'train/masks/'))
-            self.data = []
-            for i in range(len(images_list)):
-                img_path = path_Data+'train/images/' + images_list[i]
-                mask_path = path_Data+'train/masks/' + masks_list[i]
-                self.data.append([img_path, mask_path])
+            split_dir = 'train'
             self.transformer = config.train_transformer
         else:
-            images_list = sorted(os.listdir(path_Data+'val/images/'))
-            masks_list = sorted(os.listdir(path_Data+'val/masks/'))
-            self.data = []
-            for i in range(len(images_list)):
-                img_path = path_Data+'val/images/' + images_list[i]
-                mask_path = path_Data+'val/masks/' + masks_list[i]
-                self.data.append([img_path, mask_path])
+            split_dir = 'val'
             self.transformer = config.test_transformer
+
+        if file_list is None:
+            images_list = sorted(os.listdir(path_Data + split_dir + '/images/'))
+            masks_list = sorted(os.listdir(path_Data + split_dir + '/masks/'))
+            pairs = list(zip(images_list, masks_list))
+        else:
+            pairs = []
+            for item in file_list:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    pairs.append((item[0], item[1]))
+                else:
+                    pairs.append((item, item))
+
+        self.data = []
+        for img_name, mask_name in pairs:
+            img_path = path_Data + split_dir + '/images/' + img_name
+            mask_path = path_Data + split_dir + '/masks/' + mask_name
+            self.data.append([img_path, mask_path])
         
     def __getitem__(self, indx):
         img_path, msk_path = self.data[indx]

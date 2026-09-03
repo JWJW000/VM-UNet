@@ -70,6 +70,32 @@ python train.py  # Train and test VM-UNet on the ISIC17 or ISIC18 dataset.
 python train_synapse.py  # Train and test VM-UNet on the Synapse dataset.
 ```
 
+## 3.1 Scan-aware semi-supervised VM-UNet (main thesis line)
+
+后续实验、消融、Go/No-Go 和写作排期见 **[docs/后续研究路线.md](docs/后续研究路线.md)**。
+
+This is the **scan-aware SSL** protocol: EMA teacher uses all 4 Cross-Scan directions; the student drops 2 directions on unlabeled images; a complementary 2-dir student view adds direction consistency. Splits are frozen under `./splits/` so labeled sets are not reshuffled.
+
+```bash
+# 10% labeled on ISIC18 (default). Also run 0.05 and 0.2.
+python train_ssl.py --labeled_ratio 0.1 --datasets isic18 --gpu 0
+
+# Ablations
+python train_ssl.py --labeled_ratio 0.1 --no_dir_consistency
+python train_ssl.py --labeled_ratio 0.1 --no_scan_dropout
+
+# Cross-domain: train on ISIC18, test on ISIC17 val (source normalization)
+python eval_cross_domain.py \
+  --ckpt results/<run>/checkpoints/best-epoch*-loss*.pth \
+  --source isic18 --target isic17
+```
+
+Unit tests (no GPU, no `mamba_ssm`):
+
+```bash
+python -m pytest tests/test_scan_utils.py tests/test_ssl_split.py
+```
+
 **NOTE**: If you want to use the trained checkpoint for inference testing only and save the corresponding test images, you can follow these steps:  
 
 - **In `config_setting`**:  

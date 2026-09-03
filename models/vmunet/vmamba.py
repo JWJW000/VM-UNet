@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from einops import rearrange, repeat
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from .scan_utils import combine_scan_directions
 try:
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
 except:
@@ -453,7 +454,7 @@ class SS2D(nn.Module):
 
         return out_y[:, 0], inv_y[:, 0], wh_y, invwh_y
 
-    def forward(self, x: torch.Tensor, **kwargs):
+    def forward(self, x: torch.Tensor, scan_mask=None, **kwargs):
         B, H, W, C = x.shape
 
         xz = self.in_proj(x)
@@ -463,7 +464,7 @@ class SS2D(nn.Module):
         x = self.act(self.conv2d(x)) # (b, d, h, w)
         y1, y2, y3, y4 = self.forward_core(x)
         assert y1.dtype == torch.float32
-        y = y1 + y2 + y3 + y4
+        y = combine_scan_directions((y1, y2, y3, y4), scan_mask)
         y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
         y = self.out_norm(y)
         y = y * F.silu(z)
@@ -488,8 +489,8 @@ class VSSBlock(nn.Module):
         self.self_attention = SS2D(d_model=hidden_dim, dropout=attn_drop_rate, d_state=d_state, **kwargs)
         self.drop_path = DropPath(drop_path)
 
-    def forward(self, input: torch.Tensor):
-        x = input + self.drop_path(self.self_attention(self.ln_1(input)))
+    def forward(self, input: torch.Tensor, scan_mask=None):
+        x = input + self.drop_path(self.self_attention(self.ln_1(input), scan_mask=scan_mask))
         return x
 
 
@@ -546,12 +547,12 @@ class VSSLayer(nn.Module):
             self.downsample = None
 
 
-    def forward(self, x):
+    def forward(self, x, scan_mask=None):
         for blk in self.blocks:
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x)
+                x = checkpoint.checkpoint(blk, x, scan_mask)
             else:
-                x = blk(x)
+                x = blk(x, scan_mask=scan_mask)
         
         if self.downsample is not None:
             x = self.downsample(x)
@@ -613,14 +614,14 @@ class VSSLayer_up(nn.Module):
             self.upsample = None
 
 
-    def forward(self, x):
+    def forward(self, x, scan_mask=None):
         if self.upsample is not None:
             x = self.upsample(x)
         for blk in self.blocks:
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x)
+                x = checkpoint.checkpoint(blk, x, scan_mask)
             else:
-                x = blk(x)
+                x = blk(x, scan_mask=scan_mask)
         return x
     
 
@@ -719,7 +720,7 @@ class VSSM(nn.Module):
     def no_weight_decay_keywords(self):
         return {'relative_position_bias_table'}
 
-    def forward_features(self, x):
+    def forward_features(self, x, scan_mask=None):
         skip_list = []
         x = self.patch_embed(x)
         if self.ape:
@@ -728,15 +729,15 @@ class VSSM(nn.Module):
 
         for layer in self.layers:
             skip_list.append(x)
-            x = layer(x)
+            x = layer(x, scan_mask=scan_mask)
         return x, skip_list
     
-    def forward_features_up(self, x, skip_list):
+    def forward_features_up(self, x, skip_list, scan_mask=None):
         for inx, layer_up in enumerate(self.layers_up):
             if inx == 0:
-                x = layer_up(x)
+                x = layer_up(x, scan_mask=scan_mask)
             else:
-                x = layer_up(x+skip_list[-inx])
+                x = layer_up(x+skip_list[-inx], scan_mask=scan_mask)
 
         return x
     
@@ -756,9 +757,9 @@ class VSSM(nn.Module):
             x = layer(x)
         return x
 
-    def forward(self, x):
-        x, skip_list = self.forward_features(x)
-        x = self.forward_features_up(x, skip_list)
+    def forward(self, x, scan_mask=None):
+        x, skip_list = self.forward_features(x, scan_mask=scan_mask)
+        x = self.forward_features_up(x, skip_list, scan_mask=scan_mask)
         x = self.forward_final(x)
         
         return x

@@ -24,10 +24,10 @@ class VMUNet(nn.Module):
                            drop_path_rate=drop_path_rate,
                         )
     
-    def forward(self, x):
+    def forward(self, x, scan_mask=None):
         if x.size()[1] == 1:
             x = x.repeat(1,3,1,1)
-        logits = self.vmunet(x)
+        logits = self.vmunet(x, scan_mask=scan_mask)
         if self.num_classes == 1: return torch.sigmoid(logits)
         else: return logits
     
