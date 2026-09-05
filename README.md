@@ -24,7 +24,7 @@ The .whl files of causal_conv1d and mamba_ssm could be found here. {[Baidu](http
 ## 1. Prepare the dataset
 
 ### ISIC datasets
-- The ISIC17 and ISIC18 datasets, divided into a 7:3 ratio, can be found here {[Baidu](https://pan.baidu.com/s/1Y0YupaH21yDN5uldl7IcZA?pwd=dybm)}. 
+- The ISIC17 and ISIC18 datasets, divided into a 7:3 ratio, can be found here {[Baidu](https://pan.baidu.com/s/1Y0YupaH21yDN5uldl7IcZA?pwd=dybm)}.
 
 - After downloading the datasets, you are supposed to put them into './data/isic17/' and './data/isic18/', and the file format reference is as follows. (take the ISIC17 dataset as an example.)
 
@@ -70,40 +70,40 @@ python train.py  # Train and test VM-UNet on the ISIC17 or ISIC18 dataset.
 python train_synapse.py  # Train and test VM-UNet on the Synapse dataset.
 ```
 
-## 3.1 Scan-aware semi-supervised VM-UNet (main thesis line)
+## 3.1 Full-supervision research (current direction)
 
-后续实验、消融、Go/No-Go 和写作排期见 **[docs/后续研究路线.md](docs/后续研究路线.md)**。
-
-This is the **scan-aware SSL** protocol: EMA teacher uses all 4 Cross-Scan directions; the student drops 2 directions on unlabeled images; a complementary 2-dir student view adds direction consistency. Splits are frozen under `./splits/` so labeled sets are not reshuffled.
+当前目标是在相同全标注条件下改善 VM-UNet。执行流程与实验协议见 **[docs/后续研究路线.md](docs/后续研究路线.md)**。
 
 ```bash
-# 10% labeled on ISIC18 (default). Also run 0.05 and 0.2.
-python train_ssl.py --labeled_ratio 0.1 --datasets isic18 --gpu 0
+# Freeze the existing development split; no torch/GPU required
+python prepare_full_split.py --data-path data/isic2018 --output splits/full_isic18_legacy.json
 
-# Ablations
-python train_ssl.py --labeled_ratio 0.1 --no_dir_consistency
-python train_ssl.py --labeled_ratio 0.1 --no_scan_dropout
+# Diagnose an existing trusted baseline checkpoint
+python analyze_full.py --ckpt PATH_TO_BEST.pth --data-path data/isic2018 \
+  --manifest splits/full_isic18_legacy.json --preprocessing legacy \
+  --output results/diagnosis_baseline --gpu 0
 
-# Cross-domain: train on ISIC18, test on ISIC17 val (source normalization)
-python eval_cross_domain.py \
-  --ckpt results/<run>/checkpoints/best-epoch*-loss*.pth \
-  --source isic18 --target isic17
+# Controlled fully supervised baseline (all training labels used)
+python train_full.py --data-path data/isic2018 --manifest splits/full_isic18_legacy.json \
+  --output results/full_b0_s42 --seed 42 --gpu 0
+
+python -m pytest -q tests
 ```
 
-Unit tests (no GPU, no `mamba_ssm`):
+`train_full.py` records per-epoch metrics, selects checkpoints by validation pooled Dice, and supports explicit `--resume`. `analyze_full.py` exports per-image Dice/IoU, boundary F1, HD95 in resized-grid pixels, size groups, and failure panels. See the roadmap for empty-mask conventions and protocol differences from the original runner. Validation scores are not independent test results.
 
-```bash
-python -m pytest tests/test_scan_utils.py tests/test_ssl_split.py
-```
+An optional `--boundary-weight 2` is a controlled loss probe, **not a validated new method**. Run it only after diagnosis supports boundary errors, with the same settings as the new baseline.
 
-**NOTE**: If you want to use the trained checkpoint for inference testing only and save the corresponding test images, you can follow these steps:  
+The earlier scan-aware semi-supervised scripts (`train_ssl.py`, `eval_cross_domain.py`) remain available as historical experiments. Their direction is paused; see the [archived plan](docs/archive/扫描半监督路线_已暂停.md).
 
-- **In `config_setting`**:  
-   - Set the parameter `only_test_and_save_figs` to `True`.  
-   - Fill in the path of the trained checkpoint in `best_ckpt_path`.  
-   - Specify the save path for test images in `img_save_path`.  
+**NOTE**: If you want to use the trained checkpoint for inference testing only and save the corresponding test images, you can follow these steps:
 
-- **Execute the script**:  
+- **In `config_setting`**:
+   - Set the parameter `only_test_and_save_figs` to `True`.
+   - Fill in the path of the trained checkpoint in `best_ckpt_path`.
+   - Specify the save path for test images in `img_save_path`.
+
+- **Execute the script**:
    After setting the above parameters, you can run `train.py`.
 
 ## 4. Obtain the outputs
