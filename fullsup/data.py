@@ -27,7 +27,7 @@ def pairs_in(root, split):
 
 def validate_manifest(root, manifest):
     root = Path(root).resolve()
-    seen_paths, seen_ids, seen_content = set(), set(), {}
+    seen_paths, seen_content = set(), {}
     for split in ('train', 'val'):
         if not manifest.get(split):
             raise ValueError('Empty manifest partition: ' + split)
@@ -39,11 +39,10 @@ def validate_manifest(root, manifest):
                 if root not in path.parents or not path.is_file():
                     raise ValueError('Invalid dataset path: ' + name)
             image_path = (root / pair[0]).resolve()
-            image_id = image_path.stem
-            if image_path in seen_paths or image_id in seen_ids:
+            # Legacy ISIC folders reuse numeric stems across train/val; paths differ.
+            if image_path in seen_paths:
                 raise ValueError('Repeated image/path across manifest: ' + pair[0])
             seen_paths.add(image_path)
-            seen_ids.add(image_id)
             digest = hashlib.sha256(image_path.read_bytes()).hexdigest()
             if digest in seen_content and seen_content[digest] != split:
                 raise ValueError('Identical image bytes across train/val: ' + pair[0])

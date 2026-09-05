@@ -91,9 +91,16 @@ def build_model(pretrained=None):
 
 def load_weights(model, checkpoint):
     # Only load trusted, user-owned checkpoints: legacy torch.load uses pickle.
-    state = torch.load(checkpoint, map_location='cpu', weights_only=False)
-    model.load_state_dict(state.get('model_state_dict', state))
-    return state.get('config', {})
+    try:
+        state = torch.load(checkpoint, map_location='cpu', weights_only=False)
+    except TypeError:
+        state = torch.load(checkpoint, map_location='cpu')
+    payload = state.get('model_state_dict', state)
+    # Legacy best.pth may include thop profiling buffers.
+    cleaned = {k: v for k, v in payload.items()
+               if not k.endswith('total_ops') and not k.endswith('total_params')}
+    model.load_state_dict(cleaned, strict=False)
+    return state.get('config', {}) if isinstance(state, dict) else {}
 
 
 def atomic_save(state, path):
