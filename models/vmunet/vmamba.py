@@ -758,7 +758,10 @@ class VSSM(nn.Module):
         return x
 
     def forward(self, x, scan_mask=None):
+        image = x
         x, skip_list = self.forward_features(x, scan_mask=scan_mask)
+        if hasattr(self, 'detail_decoder'):
+            return self.detail_decoder(image, x, skip_list)
         x = self.forward_features_up(x, skip_list, scan_mask=scan_mask)
         x = self.forward_final(x)
         
@@ -768,5 +771,4 @@ class VSSM(nn.Module):
 
 
     
-
 

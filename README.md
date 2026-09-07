@@ -94,14 +94,14 @@ python -m pytest -q tests
 
 The completed three-seed baseline scored **89.53% ± 0.57%** validation pooled Dice; fixed boundary weighting scored **89.50% ± 0.62%**, so that probe is paused.
 
-Current candidate: `--output-refine` adds a zero-initialized residual correction after final upsampling (5,808 extra parameters). Keep the default BCE+Dice and all baseline settings:
+Current candidate: **R2 multi-scale detail decoder** (`--decoder multiscale`). It replaces the original decoder with gated top-down feature fusion, four-scale aggregation, and half/full-resolution image-detail branches. The pretrained Mamba encoder is retained; total parameters are 14,715,809. Keep the original BCE+Dice and baseline training settings:
 
 ```bash
 python train_full.py --data-path data/isic2018 --manifest splits/full_isic18_legacy.json \
-  --output results/full_refine_s42 --seed 42 --output-refine --gpu 0
+  --output results/full_multiscale_s42 --seed 42 --decoder multiscale --gpu 0
 ```
 
-Evaluation automatically reconstructs refinement from checkpoint configuration. This candidate has not yet demonstrated an accuracy gain; see the roadmap for smoke testing, resume and paired evaluation.
+Evaluation reconstructs the decoder from checkpoint configuration. This candidate has not demonstrated an accuracy gain yet; follow the roadmap's same-batch GPU smoke test before the full run. The earlier small R1 (`--output-refine`) remains available as a separate variant; do not combine it with the multiscale decoder.
 
 The earlier scan-aware semi-supervised scripts (`train_ssl.py`, `eval_cross_domain.py`) remain available as historical experiments. Their direction is paused; see the [archived plan](docs/archive/扫描半监督路线_已暂停.md).
 

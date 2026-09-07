@@ -27,8 +27,12 @@ def parse_args():
     parser.add_argument('--preprocessing', choices=['corrected', 'legacy'], default='corrected')
     parser.add_argument('--boundary-weight', type=float, default=0.0, help='0 = baseline; >0 = edge BCE probe')
     parser.add_argument('--output-refine', action='store_true', help='Enable the 3x3 residual output refinement (R1)')
+    parser.add_argument('--decoder', choices=['original', 'multiscale'], default='original',
+                        help='multiscale: replace the decoder with gated feature fusion and image-detail branches (R2)')
     parser.add_argument('--resume', action='store_true', help='Resume latest.pth in the same output directory')
     args = parser.parse_args()
+    if args.decoder == 'multiscale' and args.output_refine:
+        parser.error('--decoder multiscale and --output-refine are separate model variants')
     args.t_max = args.t_max or args.epochs
     if min(args.epochs, args.batch_size, args.size, args.t_max) < 1 or args.size % 32:
         parser.error('Positive epochs/batch/t-max and size divisible by 32 required')
@@ -57,6 +61,7 @@ def main():
     if args.resume:
         saved_config = json.loads((output / 'config.json').read_text())
         saved_config.setdefault('output_refine', False)
+        saved_config.setdefault('decoder', 'original')
         if saved_config != config:
             raise ValueError('Resume config differs; use original arguments or a fresh output directory')
     else:
@@ -79,7 +84,9 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=0, pin_memory=True, generator=generator)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
-    model = build_model(None if args.resume else args.pretrained, output_refine=args.output_refine).cuda()
+    model = build_model(None if args.resume else args.pretrained,
+                        output_refine=args.output_refine, decoder=args.decoder).cuda()
+    print('Model parameters: {:,}'.format(sum(p.numel() for p in model.parameters())), flush=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.t_max, eta_min=args.eta_min)
     start, best = 1, -1.0

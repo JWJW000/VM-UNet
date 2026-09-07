@@ -104,13 +104,31 @@ def enable_output_refinement(model):
             model.vmunet.final_conv = RefinedOutputHead(model.vmunet.final_conv)
 
 
-def build_model(pretrained=None, output_refine=False):
+def configure_decoder(model, decoder):
+    if decoder not in ('original', 'multiscale'):
+        raise ValueError('Unknown decoder: ' + str(decoder))
+    if decoder == 'multiscale' and not hasattr(model.vmunet, 'detail_decoder'):
+        from models.vmunet.detail_decoder import DetailDecoder
+        backbone = model.vmunet
+        if isinstance(backbone.final_conv, RefinedOutputHead):
+            raise ValueError('Multiscale decoder and R1 output refinement are separate experiments')
+        with torch.random.fork_rng(devices=[]):
+            backbone.detail_decoder = DetailDecoder(
+                backbone.dims, backbone.patch_embed.proj.in_channels, backbone.num_classes)
+        # Remove replaced parameters from optimization and checkpoints.
+        del backbone.layers_up, backbone.final_up, backbone.final_conv
+
+
+def build_model(pretrained=None, output_refine=False, decoder='original'):
+    if decoder != 'original' and output_refine:
+        raise ValueError('Multiscale decoder and R1 output refinement are separate experiments')
     from models.vmunet.vmunet import VMUNet
     model = VMUNet(input_channels=3, num_classes=1, depths=[2, 2, 2, 2],
                    depths_decoder=[2, 2, 2, 1], drop_path_rate=0.2,
                    load_ckpt_path=pretrained)
     if pretrained:
         model.load_from()
+    configure_decoder(model, decoder)
     if output_refine:
         enable_output_refinement(model)
     return model
@@ -125,6 +143,10 @@ def load_weights(model, checkpoint):
             raise
         state = torch.load(checkpoint, map_location='cpu')
     config = state.get('config', {})
+    decoder = config.get('decoder', 'original')
+    if decoder != 'original' and config.get('output_refine', False):
+        raise ValueError('Incompatible decoder and output_refine checkpoint configuration')
+    configure_decoder(model, decoder)
     if config.get('output_refine', False):
         enable_output_refinement(model)
     payload = state.get('model_state_dict', state)

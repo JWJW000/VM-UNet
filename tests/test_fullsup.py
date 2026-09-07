@@ -118,14 +118,16 @@ def test_preprocessing_binary_masks_and_constant_images(tmp_path):
     assert name == 'image.png'
 
 
-@pytest.mark.parametrize('output_refine', [False, True])
-def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, output_refine):
+@pytest.mark.parametrize('variant', ['original', 'refine', 'multiscale'])
+def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, variant):
     """Exercise the real runner loop with a tiny CPU model, including RNG restoration."""
     import sys
     import torch
     from PIL import Image
     import train_full
     import fullsup.runtime as runtime
+    output_refine = variant == 'refine'
+    decoder = 'multiscale' if variant == 'multiscale' else 'original'
     for split in ('train', 'val'):
         for folder in ('images', 'masks'):
             (tmp_path / split / folder).mkdir(parents=True)
@@ -144,16 +146,24 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, output
     monkeypatch.setattr(torch.Tensor, 'cuda', lambda self, *a, **kw: self)
     monkeypatch.setattr(torch.nn.Module, 'cuda', lambda self, *a, **kw: self)
     class TinyModel(torch.nn.Module):
-        def __init__(self):
+        def __init__(self, decoder):
             super().__init__()
             self.vmunet = torch.nn.Module()
-            self.vmunet.final_conv = torch.nn.Conv2d(3, 1, 1)
+            if decoder == 'multiscale':
+                from models.vmunet.detail_decoder import DetailDecoder
+                self.vmunet.detail_decoder = DetailDecoder([3, 3, 3, 3], 3, 1)
+            else:
+                self.vmunet.final_conv = torch.nn.Conv2d(3, 1, 1)
 
         def forward(self, x):
+            if hasattr(self.vmunet, 'detail_decoder'):
+                features = [torch.nn.functional.avg_pool2d(x / 255, scale).permute(0, 2, 3, 1)
+                            for scale in (4, 8, 16, 32)]
+                return self.vmunet.detail_decoder(x, features[-1], features).sigmoid()
             return self.vmunet.final_conv(x / 255).sigmoid()
 
-    def build(_, output_refine=False):
-        result = TinyModel()
+    def build(_, output_refine=False, decoder='original'):
+        result = TinyModel(decoder)
         if output_refine:
             runtime.enable_output_refinement(result)
         return result
@@ -170,7 +180,8 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, output
         monkeypatch.setattr(sys, 'argv', ['train_full.py', '--data-path', str(tmp_path),
             '--manifest', str(manifest_path), '--output', str(tmp_path / name),
             '--epochs', '2', '--batch-size', '2', '--size', '32'] +
-            (['--output-refine'] if output_refine else []) + (['--resume'] if resume else []))
+            ['--decoder', decoder] + (['--output-refine'] if output_refine else []) +
+            (['--resume'] if resume else []))
         train_full.main()
 
     run('continuous')
@@ -184,10 +195,11 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, output
     monkeypatch.setattr(runtime, 'atomic_save', interrupt_after_epoch)
     with pytest.raises(InterruptedError):
         run('resumed')
-    if not output_refine:
+    if variant == 'original':
         config_path = tmp_path / 'resumed/config.json'
         legacy_config = json.loads(config_path.read_text())
         legacy_config.pop('output_refine')
+        legacy_config.pop('decoder')
         config_path.write_text(json.dumps(legacy_config))
     monkeypatch.setattr(runtime, 'atomic_save', original_save)
     run('resumed', resume=True)
@@ -291,3 +303,47 @@ def test_output_refinement_identity_gradients_and_strict_loading(tmp_path):
     torch.save(state, path)
     with pytest.raises(RuntimeError, match='Missing key'):
         load_weights(model(), path)
+
+
+def test_multiscale_decoder_end_to_end_and_checkpoint(tmp_path, monkeypatch):
+    """Real encoder/decoder wiring; scan kernel replaced by a CPU shape/gradient stub."""
+    import torch
+    from models.vmunet import vmamba
+    from fullsup.runtime import build_model, load_weights, segmentation_loss
+
+    def scan_stub(u, delta, A, B, C, D, **kwargs):
+        return u * D[None, :, None]
+
+    monkeypatch.setattr(vmamba, 'selective_scan_fn', scan_stub, raising=False)
+    torch.manual_seed(42)
+    baseline = build_model()
+    expected_rng = torch.get_rng_state()
+    torch.manual_seed(42)
+    model = build_model(decoder='multiscale')
+    assert torch.equal(expected_rng, torch.get_rng_state())
+    for key, value in baseline.state_dict().items():
+        if key.startswith(('vmunet.patch_embed.', 'vmunet.layers.')):
+            assert torch.equal(value, model.state_dict()[key]), key
+    del baseline
+    assert not hasattr(model.vmunet, 'layers_up')
+    assert not hasattr(model.vmunet, 'final_up')
+    assert not hasattr(model.vmunet, 'final_conv')
+    image = torch.rand(1, 3, 32, 64) * 255
+    model.eval()
+    prediction = model(image)
+    assert prediction.shape == (1, 1, 32, 64)
+    assert torch.isfinite(prediction).all()
+    segmentation_loss(prediction, torch.rand_like(prediction).round()).backward()
+    for name, parameter in model.vmunet.detail_decoder.named_parameters():
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
+        assert parameter.grad.abs().sum() > 0, name
+    assert model.vmunet.patch_embed.proj.weight.grad.abs().sum() > 0
+    path = tmp_path / 'multiscale.pth'
+    torch.save(dict(model_state_dict=model.state_dict(), config={'decoder': 'multiscale'}), path)
+    restored = build_model()
+    assert load_weights(restored, path)['decoder'] == 'multiscale'
+    restored.eval()
+    with torch.no_grad():
+        assert torch.equal(restored(image), model(image))
+    with pytest.raises(ValueError, match='separate experiments'):
+        build_model(output_refine=True, decoder='multiscale')

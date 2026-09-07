@@ -70,6 +70,7 @@ def main():
     summary = summarize(rows)
     summary.update(checkpoint=str(Path(args.ckpt).resolve()), preprocessing=preprocessing, size=size,
                    output_refine=config.get('output_refine', False),
+                   decoder=config.get('decoder', 'original'),
                    threshold=0.5, boundary_tolerance_px=args.boundary_tolerance,
                    evaluation_partition='manifest val' if args.manifest else args.split,
                    note='Pooled Dice matches legacy aggregation; macro Dice averages images. '
