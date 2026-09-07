@@ -92,7 +92,16 @@ python -m pytest -q tests
 
 `train_full.py` records per-epoch metrics, selects checkpoints by validation pooled Dice, and supports explicit `--resume`. `analyze_full.py` exports per-image Dice/IoU, boundary F1, HD95 in resized-grid pixels, size groups, and failure panels. See the roadmap for empty-mask conventions and protocol differences from the original runner. Validation scores are not independent test results.
 
-An optional `--boundary-weight 2` is a controlled loss probe, **not a validated new method**. Run it only after diagnosis supports boundary errors, with the same settings as the new baseline.
+The completed three-seed baseline scored **89.53% ± 0.57%** validation pooled Dice; fixed boundary weighting scored **89.50% ± 0.62%**, so that probe is paused.
+
+Current candidate: `--output-refine` adds a zero-initialized residual correction after final upsampling (5,808 extra parameters). Keep the default BCE+Dice and all baseline settings:
+
+```bash
+python train_full.py --data-path data/isic2018 --manifest splits/full_isic18_legacy.json \
+  --output results/full_refine_s42 --seed 42 --output-refine --gpu 0
+```
+
+Evaluation automatically reconstructs refinement from checkpoint configuration. This candidate has not yet demonstrated an accuracy gain; see the roadmap for smoke testing, resume and paired evaluation.
 
 The earlier scan-aware semi-supervised scripts (`train_ssl.py`, `eval_cross_domain.py`) remain available as historical experiments. Their direction is paused; see the [archived plan](docs/archive/扫描半监督路线_已暂停.md).
 

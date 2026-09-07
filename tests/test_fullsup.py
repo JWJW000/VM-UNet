@@ -39,6 +39,18 @@ def test_reject_exact_copy_between_partitions(tmp_path):
         make_manifest(tmp_path)
 
 
+def test_split_local_numeric_names_are_not_global_ids(tmp_path):
+    make_files(tmp_path, 'train', 1)
+    make_files(tmp_path, 'val', 1)
+    for split in ('train', 'val'):
+        (tmp_path / split / 'images' / (split + '_0.png')).rename(tmp_path / split / 'images/0.png')
+        (tmp_path / split / 'masks' / (split + '_0_segmentation.png')).rename(tmp_path / split / 'masks/0.png')
+    assert len(make_manifest(tmp_path)['val']) == 1
+    (tmp_path / 'val/images/0.png').write_bytes((tmp_path / 'train/images/0.png').read_bytes())
+    with pytest.raises(ValueError, match='Identical image bytes'):
+        make_manifest(tmp_path)
+
+
 def test_overlap_boundary_and_empty_cases():
     a = np.zeros((20, 20), bool)
     a[5:15, 5:15] = True
@@ -106,7 +118,8 @@ def test_preprocessing_binary_masks_and_constant_images(tmp_path):
     assert name == 'image.png'
 
 
-def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch):
+@pytest.mark.parametrize('output_refine', [False, True])
+def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, output_refine):
     """Exercise the real runner loop with a tiny CPU model, including RNG restoration."""
     import sys
     import torch
@@ -130,8 +143,22 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch):
     monkeypatch.setattr(torch.cuda, 'set_rng_state_all', lambda _: None)
     monkeypatch.setattr(torch.Tensor, 'cuda', lambda self, *a, **kw: self)
     monkeypatch.setattr(torch.nn.Module, 'cuda', lambda self, *a, **kw: self)
-    monkeypatch.setattr(runtime, 'build_model', lambda _: torch.nn.Sequential(
-        torch.nn.Conv2d(3, 1, 1), torch.nn.Sigmoid()))
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vmunet = torch.nn.Module()
+            self.vmunet.final_conv = torch.nn.Conv2d(3, 1, 1)
+
+        def forward(self, x):
+            return self.vmunet.final_conv(x / 255).sigmoid()
+
+    def build(_, output_refine=False):
+        result = TinyModel()
+        if output_refine:
+            runtime.enable_output_refinement(result)
+        return result
+
+    monkeypatch.setattr(runtime, 'build_model', build)
     original_validate = runtime.validate
     monkeypatch.setattr(runtime, 'validate', lambda model, loader, device: original_validate(model, loader, 'cpu'))
     # CPU DataLoader must not attempt to allocate CUDA-pinned memory.
@@ -142,7 +169,8 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch):
     def run(name, resume=False):
         monkeypatch.setattr(sys, 'argv', ['train_full.py', '--data-path', str(tmp_path),
             '--manifest', str(manifest_path), '--output', str(tmp_path / name),
-            '--epochs', '2', '--batch-size', '2', '--size', '32'] + (['--resume'] if resume else []))
+            '--epochs', '2', '--batch-size', '2', '--size', '32'] +
+            (['--output-refine'] if output_refine else []) + (['--resume'] if resume else []))
         train_full.main()
 
     run('continuous')
@@ -156,6 +184,11 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, 'atomic_save', interrupt_after_epoch)
     with pytest.raises(InterruptedError):
         run('resumed')
+    if not output_refine:
+        config_path = tmp_path / 'resumed/config.json'
+        legacy_config = json.loads(config_path.read_text())
+        legacy_config.pop('output_refine')
+        config_path.write_text(json.dumps(legacy_config))
     monkeypatch.setattr(runtime, 'atomic_save', original_save)
     run('resumed', resume=True)
     continuous = torch.load(tmp_path / 'continuous/latest.pth', weights_only=False)
@@ -212,3 +245,49 @@ def test_analysis_exports_csv_summary_and_worst_panels(tmp_path, monkeypatch):
     assert json.loads((out / 'summary.json').read_text())['n'] == 3
     assert len(list(out.glob('*.png'))) == 2
     assert len((out / 'per_image.csv').read_text().splitlines()) == 4
+
+
+def test_output_refinement_identity_gradients_and_strict_loading(tmp_path):
+    import torch
+    from fullsup.runtime import RefinedOutputHead, enable_output_refinement, load_weights
+
+    def model():
+        result = torch.nn.Module()
+        result.vmunet = torch.nn.Module()
+        result.vmunet.final_conv = torch.nn.Conv2d(24, 1, 1)
+        return result
+
+    original = model()
+    legacy = original.state_dict()
+    legacy['vmunet.final_conv.total_ops'] = torch.tensor(0.)
+    path = tmp_path / 'legacy.pth'
+    torch.save(legacy, path)
+    candidate = model()
+    assert load_weights(candidate, path) == {}
+    x = torch.randn(2, 24, 8, 8)
+    expected = original.vmunet.final_conv(x).detach()
+    rng = torch.get_rng_state()
+    enable_output_refinement(candidate)
+    assert torch.equal(rng, torch.get_rng_state())
+    head = candidate.vmunet.final_conv
+    assert isinstance(head, RefinedOutputHead)
+    assert torch.equal(head(x), expected)
+    assert sum(p.numel() for p in head.residual.parameters()) == 5808
+    optimizer = torch.optim.SGD(head.parameters(), lr=0.1)
+    for _ in range(2):
+        optimizer.zero_grad()
+        head(x).square().mean().backward()
+        optimizer.step()
+    assert head.residual[0].weight.grad.abs().sum() > 0
+    assert head.residual[-1].weight.grad.abs().sum() > 0
+    assert not torch.equal(head(x), expected)
+    state = dict(model_state_dict=candidate.state_dict(), config={'output_refine': True})
+    path = tmp_path / 'refined.pth'
+    torch.save(state, path)
+    restored = model()
+    assert load_weights(restored, path)['output_refine'] is True
+    assert torch.equal(restored.vmunet.final_conv(x), head(x))
+    state['model_state_dict'].pop('vmunet.final_conv.residual.0.weight')
+    torch.save(state, path)
+    with pytest.raises(RuntimeError, match='Missing key'):
+        load_weights(model(), path)

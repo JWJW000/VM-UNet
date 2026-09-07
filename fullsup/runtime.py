@@ -79,13 +79,40 @@ def segmentation_loss(prob, target, boundary_weight=0.0):
     return bce_loss + dice_loss
 
 
-def build_model(pretrained=None):
+class RefinedOutputHead(torch.nn.Module):
+    """Local residual refinement after final upsampling, before the existing classifier."""
+    def __init__(self, classifier):
+        super().__init__()
+        channels = classifier.in_channels
+        self.residual = torch.nn.Sequential(
+            torch.nn.Conv2d(channels, channels, 3, padding=1),
+            torch.nn.GELU(),
+            torch.nn.Conv2d(channels, channels, 1),
+        )
+        torch.nn.init.zeros_(self.residual[-1].weight)
+        torch.nn.init.zeros_(self.residual[-1].bias)
+        self.classifier = classifier
+
+    def forward(self, x):
+        return self.classifier(x + self.residual(x))
+
+
+def enable_output_refinement(model):
+    if not isinstance(model.vmunet.final_conv, RefinedOutputHead):
+        # Preserve the backbone initialization and subsequent training RNG sequence.
+        with torch.random.fork_rng(devices=[]):
+            model.vmunet.final_conv = RefinedOutputHead(model.vmunet.final_conv)
+
+
+def build_model(pretrained=None, output_refine=False):
     from models.vmunet.vmunet import VMUNet
     model = VMUNet(input_channels=3, num_classes=1, depths=[2, 2, 2, 2],
                    depths_decoder=[2, 2, 2, 1], drop_path_rate=0.2,
                    load_ckpt_path=pretrained)
     if pretrained:
         model.load_from()
+    if output_refine:
+        enable_output_refinement(model)
     return model
 
 
@@ -93,14 +120,19 @@ def load_weights(model, checkpoint):
     # Only load trusted, user-owned checkpoints: legacy torch.load uses pickle.
     try:
         state = torch.load(checkpoint, map_location='cpu', weights_only=False)
-    except TypeError:
+    except TypeError as error:
+        if 'weights_only' not in str(error):
+            raise
         state = torch.load(checkpoint, map_location='cpu')
+    config = state.get('config', {})
+    if config.get('output_refine', False):
+        enable_output_refinement(model)
     payload = state.get('model_state_dict', state)
-    # Legacy best.pth may include thop profiling buffers.
-    cleaned = {k: v for k, v in payload.items()
-               if not k.endswith('total_ops') and not k.endswith('total_params')}
-    model.load_state_dict(cleaned, strict=False)
-    return state.get('config', {}) if isinstance(state, dict) else {}
+    # Old THOP-profiled checkpoints contain counters, not model parameters.
+    payload = {k: v for k, v in payload.items()
+               if k.split('.')[-1] not in ('total_ops', 'total_params')}
+    model.load_state_dict(payload, strict=True)
+    return config
 
 
 def atomic_save(state, path):

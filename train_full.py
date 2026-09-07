@@ -1,4 +1,4 @@
-"""Controlled full-label baseline and boundary-weighted loss probe for ISIC."""
+"""Controlled full-label baseline and optional output refinement for ISIC."""
 import argparse
 import csv
 import hashlib
@@ -26,6 +26,7 @@ def parse_args():
     parser.add_argument('--t-max', type=int, default=None, help='Default: epochs; 50 audits old LR schedule')
     parser.add_argument('--preprocessing', choices=['corrected', 'legacy'], default='corrected')
     parser.add_argument('--boundary-weight', type=float, default=0.0, help='0 = baseline; >0 = edge BCE probe')
+    parser.add_argument('--output-refine', action='store_true', help='Enable the 3x3 residual output refinement (R1)')
     parser.add_argument('--resume', action='store_true', help='Resume latest.pth in the same output directory')
     args = parser.parse_args()
     args.t_max = args.t_max or args.epochs
@@ -54,7 +55,9 @@ def main():
     config.pop('resume')
     config['manifest_sha256'] = hashlib.sha256(Path(args.manifest).read_bytes()).hexdigest()
     if args.resume:
-        if json.loads((output / 'config.json').read_text()) != config:
+        saved_config = json.loads((output / 'config.json').read_text())
+        saved_config.setdefault('output_refine', False)
+        if saved_config != config:
             raise ValueError('Resume config differs; use original arguments or a fresh output directory')
     else:
         output.mkdir(parents=True, exist_ok=False)
@@ -76,7 +79,7 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=0, pin_memory=True, generator=generator)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
-    model = build_model(None if args.resume else args.pretrained).cuda()
+    model = build_model(None if args.resume else args.pretrained, output_refine=args.output_refine).cuda()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.t_max, eta_min=args.eta_min)
     start, best = 1, -1.0
