@@ -99,10 +99,10 @@ Current candidate: **R3 context recovery** (`--decoder context`). It retains the
 ```bash
 python train_full.py --data-path data/isic2018 \
   --manifest splits/full_isic18_legacy.json --output results/full_context_s43 \
-  --decoder context --seed 43 --epochs 300 --stop-after 60 --gpu 0
+  --decoder context --seed 43 --epochs 300 --gpu 0
 ```
 
-`--stop-after` saves and exits without shortening the 300-epoch LR schedule. Review the [roadmap](docs/后续研究路线.md) for the CUDA smoke test, fixed budget gates and resume commands before extending training. R3 has not been evaluated on the GPU yet. Evaluation reconstructs the model from checkpoint configuration; original/R1/R2 remain available for historical checkpoints. Do not combine R1 output refinement with a custom decoder.
+See the [roadmap](docs/后续研究路线.md) for design evidence, the CUDA smoke test and full 300-epoch training commands. R3 has not been evaluated on the GPU yet. Evaluation reconstructs the model from checkpoint configuration; original/R1/R2 remain available for historical checkpoints. Do not combine R1 output refinement with a custom decoder.
 
 The earlier scan-aware semi-supervised scripts (`train_ssl.py`, `eval_cross_domain.py`) remain available as historical experiments. Their direction is paused; see the [archived plan](docs/archive/扫描半监督路线_已暂停.md).
 

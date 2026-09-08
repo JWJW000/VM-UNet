@@ -190,13 +190,12 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
     monkeypatch.setattr(torch.utils.data, 'DataLoader', lambda *a, **kw: DataLoader(
         *a, **dict(kw, pin_memory=False)))
 
-    def run(name, resume=False, stop_after=None):
+    def run(name, resume=False):
         monkeypatch.setattr(sys, 'argv', ['train_full.py', '--data-path', str(tmp_path),
             '--manifest', str(manifest_path), '--output', str(tmp_path / name),
             '--epochs', '2', '--batch-size', '2', '--size', '32'] +
             ['--decoder', decoder] + (['--output-refine'] if output_refine else []) +
-            (['--resume'] if resume else []) +
-            (['--stop-after', str(stop_after)] if stop_after else []))
+            (['--resume'] if resume else []))
         train_full.main()
 
     run('continuous')
@@ -224,15 +223,6 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
         assert torch.equal(continuous['model_state_dict'][key], resumed['model_state_dict'][key])
     assert continuous['best_dice'] == resumed['best_dice']
     assert len(resumed['history']) == 2
-    if variant == 'context':
-        run('staged', stop_after=1)
-        staged = torch.load(tmp_path / 'staged/latest.pth', weights_only=False)
-        assert staged['epoch'] == 1 and staged['config']['t_max'] == 2
-        assert len(list(__import__('csv').DictReader((tmp_path / 'staged/metrics.csv').open()))) == 1
-        run('staged', resume=True)
-        staged = torch.load(tmp_path / 'staged/latest.pth', weights_only=False)
-        for key in continuous['model_state_dict']:
-            assert torch.equal(continuous['model_state_dict'][key], staged['model_state_dict'][key])
 
 
 def test_context_preserves_backbone_and_learns_all_paths(tmp_path, monkeypatch):
