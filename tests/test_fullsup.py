@@ -118,7 +118,7 @@ def test_preprocessing_binary_masks_and_constant_images(tmp_path):
     assert name == 'image.png'
 
 
-@pytest.mark.parametrize('variant', ['original', 'refine', 'multiscale'])
+@pytest.mark.parametrize('variant', ['original', 'refine', 'multiscale', 'context'])
 def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, variant):
     """Exercise the real runner loop with a tiny CPU model, including RNG restoration."""
     import sys
@@ -127,7 +127,7 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
     import train_full
     import fullsup.runtime as runtime
     output_refine = variant == 'refine'
-    decoder = 'multiscale' if variant == 'multiscale' else 'original'
+    decoder = variant if variant in ('multiscale', 'context') else 'original'
     for split in ('train', 'val'):
         for folder in ('images', 'masks'):
             (tmp_path / split / folder).mkdir(parents=True)
@@ -154,13 +154,27 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
                 self.vmunet.detail_decoder = DetailDecoder([3, 3, 3, 3], 3, 1)
             else:
                 self.vmunet.final_conv = torch.nn.Conv2d(3, 1, 1)
+                if decoder == 'context':
+                    from models.vmunet.context_adapter import ContextAdapter
+                    self.vmunet.context_adapter = ContextAdapter([3, 3, 3, 3], 1)
 
         def forward(self, x):
             if hasattr(self.vmunet, 'detail_decoder'):
                 features = [torch.nn.functional.avg_pool2d(x / 255, scale).permute(0, 2, 3, 1)
                             for scale in (4, 8, 16, 32)]
                 return self.vmunet.detail_decoder(x, features[-1], features).sigmoid()
-            return self.vmunet.final_conv(x / 255).sigmoid()
+            logits = self.vmunet.final_conv(x / 255)
+            if hasattr(self.vmunet, 'context_adapter'):
+                features = [torch.nn.functional.avg_pool2d(x / 255, scale).permute(0, 2, 3, 1)
+                            for scale in (4, 8, 16, 32)]
+                adapter = self.vmunet.context_adapter
+                context = adapter.encode(features[-1], features)
+                skips = adapter.augment_skips(context, features)
+                decoded = features[0] + sum(torch.nn.functional.interpolate(
+                    f.permute(0, 3, 1, 2), size=features[0].shape[1:3]).permute(0, 2, 3, 1)
+                    for f in skips[1:])
+                logits = logits + adapter(decoded, context)
+            return logits.sigmoid()
 
     def build(_, output_refine=False, decoder='original'):
         result = TinyModel(decoder)
@@ -176,12 +190,13 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
     monkeypatch.setattr(torch.utils.data, 'DataLoader', lambda *a, **kw: DataLoader(
         *a, **dict(kw, pin_memory=False)))
 
-    def run(name, resume=False):
+    def run(name, resume=False, stop_after=None):
         monkeypatch.setattr(sys, 'argv', ['train_full.py', '--data-path', str(tmp_path),
             '--manifest', str(manifest_path), '--output', str(tmp_path / name),
             '--epochs', '2', '--batch-size', '2', '--size', '32'] +
             ['--decoder', decoder] + (['--output-refine'] if output_refine else []) +
-            (['--resume'] if resume else []))
+            (['--resume'] if resume else []) +
+            (['--stop-after', str(stop_after)] if stop_after else []))
         train_full.main()
 
     run('continuous')
@@ -209,6 +224,55 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
         assert torch.equal(continuous['model_state_dict'][key], resumed['model_state_dict'][key])
     assert continuous['best_dice'] == resumed['best_dice']
     assert len(resumed['history']) == 2
+    if variant == 'context':
+        run('staged', stop_after=1)
+        staged = torch.load(tmp_path / 'staged/latest.pth', weights_only=False)
+        assert staged['epoch'] == 1 and staged['config']['t_max'] == 2
+        assert len(list(__import__('csv').DictReader((tmp_path / 'staged/metrics.csv').open()))) == 1
+        run('staged', resume=True)
+        staged = torch.load(tmp_path / 'staged/latest.pth', weights_only=False)
+        for key in continuous['model_state_dict']:
+            assert torch.equal(continuous['model_state_dict'][key], staged['model_state_dict'][key])
+
+
+def test_context_preserves_backbone_and_learns_all_paths(tmp_path, monkeypatch):
+    import torch
+    from models.vmunet import vmamba
+    from fullsup.runtime import build_model, load_weights, segmentation_loss
+    monkeypatch.setattr(vmamba, 'selective_scan_fn',
+                        lambda u, delta, A, B, C, D, **kw: u * D[None, :, None], raising=False)
+    torch.manual_seed(42)
+    baseline = build_model().eval()
+    expected_rng = torch.get_rng_state()
+    torch.manual_seed(42)
+    model = build_model(decoder='context').eval()
+    assert torch.equal(expected_rng, torch.get_rng_state())
+    for key, value in baseline.state_dict().items():
+        assert torch.equal(value, model.state_dict()[key]), key
+    image = torch.rand(1, 3, 32, 64) * 255
+    with torch.no_grad():
+        assert torch.equal(model(image), baseline(image))
+    del baseline
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    target = torch.rand(1, 1, 32, 64).round()
+    for _ in range(2):
+        optimizer.zero_grad()
+        prediction = model(image)
+        assert prediction.shape == target.shape
+        segmentation_loss(prediction, target).backward()
+        optimizer.step()
+    for name, p in model.vmunet.context_adapter.named_parameters():
+        assert p.grad is not None and torch.isfinite(p.grad).all(), name
+        assert p.grad.abs().sum() > 0, name
+    assert model.vmunet.layers_up[0].blocks[0].self_attention.in_proj.weight.grad.abs().sum() > 0
+    path = tmp_path / 'context.pth'
+    torch.save(dict(model_state_dict=model.state_dict(), config={'decoder': 'context'}), path)
+    restored = build_model().eval()
+    assert load_weights(restored, path)['decoder'] == 'context'
+    with torch.no_grad():
+        assert torch.equal(restored(image), model(image))
+    with pytest.raises(ValueError, match='separate experiments'):
+        build_model(decoder='context', output_refine=True)
 
 
 def test_legacy_eval_matches_original_normalize_resize(tmp_path):

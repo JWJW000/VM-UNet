@@ -27,12 +27,15 @@ def parse_args():
     parser.add_argument('--preprocessing', choices=['corrected', 'legacy'], default='corrected')
     parser.add_argument('--boundary-weight', type=float, default=0.0, help='0 = baseline; >0 = edge BCE probe')
     parser.add_argument('--output-refine', action='store_true', help='Enable the 3x3 residual output refinement (R1)')
-    parser.add_argument('--decoder', choices=['original', 'multiscale'], default='original',
-                        help='multiscale: replace the decoder with gated feature fusion and image-detail branches (R2)')
+    parser.add_argument('--decoder', choices=['original', 'multiscale', 'context'], default='original',
+                        help='context: preserve Mamba decoder with multiscale residual context (R3); multiscale: R2')
+    parser.add_argument('--stop-after', type=int, help='Save and exit after this epoch, keeping the full LR schedule; resume to continue')
     parser.add_argument('--resume', action='store_true', help='Resume latest.pth in the same output directory')
     args = parser.parse_args()
-    if args.decoder == 'multiscale' and args.output_refine:
-        parser.error('--decoder multiscale and --output-refine are separate model variants')
+    if args.decoder != 'original' and args.output_refine:
+        parser.error('Custom decoders and --output-refine are separate model variants')
+    if args.stop_after is not None and not 1 <= args.stop_after <= args.epochs:
+        parser.error('--stop-after must be between 1 and --epochs')
     args.t_max = args.t_max or args.epochs
     if min(args.epochs, args.batch_size, args.size, args.t_max) < 1 or args.size % 32:
         parser.error('Positive epochs/batch/t-max and size divisible by 32 required')
@@ -57,6 +60,7 @@ def main():
     output = Path(args.output)
     config = vars(args).copy()
     config.pop('resume')
+    config.pop('stop_after')
     config['manifest_sha256'] = hashlib.sha256(Path(args.manifest).read_bytes()).hexdigest()
     if args.resume:
         saved_config = json.loads((output / 'config.json').read_text())
@@ -103,7 +107,7 @@ def main():
         torch.set_rng_state(state['rng_torch'])
         torch.cuda.set_rng_state_all(state['rng_cuda'])
         generator.set_state(state['rng_loader'])
-    for epoch in range(start, args.epochs + 1):
+    for epoch in range(start, (args.stop_after or args.epochs) + 1):
         started = time.monotonic()
         model.train()
         train_loss = 0.0
@@ -141,7 +145,8 @@ def main():
             writer.writeheader()
             writer.writerows(history)
         print(json.dumps(row), flush=True)
-    print('Finished. Best validation pooled Dice: {:.6f}. No test set evaluated.'.format(best))
+    print('Saved through epoch {}/{}. Best validation pooled Dice: {:.6f}. No test set evaluated.'.format(
+        history[-1]['epoch'] if history else 0, args.epochs, best))
 
 
 if __name__ == '__main__':

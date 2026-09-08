@@ -105,8 +105,19 @@ def enable_output_refinement(model):
 
 
 def configure_decoder(model, decoder):
-    if decoder not in ('original', 'multiscale'):
+    if decoder not in ('original', 'multiscale', 'context'):
         raise ValueError('Unknown decoder: ' + str(decoder))
+    backbone = getattr(model, 'vmunet', model)
+    current = ('multiscale' if hasattr(backbone, 'detail_decoder') else
+               'context' if hasattr(backbone, 'context_adapter') else 'original')
+    if current != 'original' and current != decoder:
+        raise ValueError('Cannot switch an already configured decoder; build a fresh model')
+    if decoder == 'context' and not hasattr(backbone, 'context_adapter'):
+        from models.vmunet.context_adapter import ContextAdapter
+        if isinstance(backbone.final_conv, RefinedOutputHead):
+            raise ValueError('Context decoder and R1 output refinement are separate experiments')
+        with torch.random.fork_rng(devices=[]):
+            backbone.context_adapter = ContextAdapter(backbone.dims, backbone.num_classes)
     if decoder == 'multiscale' and not hasattr(model.vmunet, 'detail_decoder'):
         from models.vmunet.detail_decoder import DetailDecoder
         backbone = model.vmunet
@@ -121,7 +132,7 @@ def configure_decoder(model, decoder):
 
 def build_model(pretrained=None, output_refine=False, decoder='original'):
     if decoder != 'original' and output_refine:
-        raise ValueError('Multiscale decoder and R1 output refinement are separate experiments')
+        raise ValueError('Custom decoder and R1 output refinement are separate experiments')
     from models.vmunet.vmunet import VMUNet
     model = VMUNet(input_channels=3, num_classes=1, depths=[2, 2, 2, 2],
                    depths_decoder=[2, 2, 2, 1], drop_path_rate=0.2,

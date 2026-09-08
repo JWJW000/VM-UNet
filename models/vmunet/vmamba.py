@@ -762,6 +762,11 @@ class VSSM(nn.Module):
         x, skip_list = self.forward_features(x, scan_mask=scan_mask)
         if hasattr(self, 'detail_decoder'):
             return self.detail_decoder(image, x, skip_list)
+        if hasattr(self, 'context_adapter'):
+            context = self.context_adapter.encode(x, skip_list)
+            skip_list = self.context_adapter.augment_skips(context, skip_list)
+            x = self.forward_features_up(x, skip_list, scan_mask=scan_mask)
+            return self.forward_final(x) + self.context_adapter(x, context)
         x = self.forward_features_up(x, skip_list, scan_mask=scan_mask)
         x = self.forward_final(x)
         
@@ -771,4 +776,3 @@ class VSSM(nn.Module):
 
 
     
-
