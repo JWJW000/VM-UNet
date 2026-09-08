@@ -30,7 +30,16 @@ def parse_args():
     parser.add_argument('--decoder', choices=['original', 'multiscale', 'context'], default='original',
                         help='context: preserve Mamba decoder with multiscale residual context (R3); multiscale: R2')
     parser.add_argument('--resume', action='store_true', help='Resume latest.pth in the same output directory')
+    parser.add_argument('--init-checkpoint', help='Controlled B0 checkpoint for a new continuation experiment')
+    parser.add_argument('--teacher-weight', type=float, default=0.0, help='Correct/confident training-pixel KL weight; 0 disables teacher')
+    parser.add_argument('--teacher-confidence', type=float, default=0.9)
     args = parser.parse_args()
+    if not 0 <= args.teacher_weight < float('inf') or not 0.5 < args.teacher_confidence < 1:
+        parser.error('Invalid teacher weight/confidence')
+    if args.teacher_weight and not args.init_checkpoint:
+        parser.error('--teacher-weight requires --init-checkpoint')
+    if args.init_checkpoint and (args.decoder == 'multiscale' or args.output_refine or args.boundary_weight):
+        parser.error('B0 continuation supports original/context with the original supervised loss')
     if args.decoder != 'original' and args.output_refine:
         parser.error('Custom decoders and --output-refine are separate model variants')
     args.t_max = args.t_max or args.epochs
@@ -50,7 +59,8 @@ def main():
     from torch.utils.data import DataLoader
     from fullsup.data import load_manifest
     from fullsup.runtime import (SegmentationDataset, atomic_save, build_model, seed_everything,
-                                 segmentation_loss, validate, write_json)
+                                 segmentation_loss, validate, write_json, initialize_from_baseline,
+                                 teacher_constraint)
     if not torch.cuda.is_available():
         raise RuntimeError('Training requires the existing CUDA/Mamba environment')
     manifest = load_manifest(args.data_path, args.manifest)
@@ -58,10 +68,19 @@ def main():
     config = vars(args).copy()
     config.pop('resume')
     config['manifest_sha256'] = hashlib.sha256(Path(args.manifest).read_bytes()).hexdigest()
+    if args.init_checkpoint:
+        digest = hashlib.sha256()
+        with open(args.init_checkpoint, 'rb') as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(chunk)
+        config['init_sha256'] = digest.hexdigest()
     if args.resume:
         saved_config = json.loads((output / 'config.json').read_text())
         saved_config.setdefault('output_refine', False)
         saved_config.setdefault('decoder', 'original')
+        saved_config.setdefault('init_checkpoint', None)
+        saved_config.setdefault('teacher_weight', 0.0)
+        saved_config.setdefault('teacher_confidence', 0.9)
         if saved_config != config:
             raise ValueError('Resume config differs; use original arguments or a fresh output directory')
     else:
@@ -84,8 +103,15 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=0, pin_memory=True, generator=generator)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
-    model = build_model(None if args.resume else args.pretrained,
-                        output_refine=args.output_refine, decoder=args.decoder).cuda()
+    teacher = None
+    if args.init_checkpoint:
+        model, teacher = initialize_from_baseline(args.init_checkpoint, config, bool(args.teacher_weight))
+        if teacher is not None:
+            teacher = teacher.cuda()
+    else:
+        model = build_model(None if args.resume else args.pretrained,
+                            output_refine=args.output_refine, decoder=args.decoder)
+    model = model.cuda()
     print('Model parameters: {:,}'.format(sum(p.numel() for p in model.parameters())), flush=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.t_max, eta_min=args.eta_min)
@@ -103,10 +129,18 @@ def main():
         torch.set_rng_state(state['rng_torch'])
         torch.cuda.set_rng_state_all(state['rng_cuda'])
         generator.set_state(state['rng_loader'])
+    elif args.init_checkpoint:
+        # Both the continuation control and proposed method retain their starting best.
+        metrics = validate(model, val_loader, 'cuda')
+        best = metrics['pooled_dice']
+        atomic_save(dict(model_state_dict=model.state_dict(), config=config, epoch=0,
+                         metrics=metrics), output / 'best.pth')
+        write_json(output / 'initial_metrics.json', metrics)
     for epoch in range(start, args.epochs + 1):
         started = time.monotonic()
         model.train()
         train_loss = 0.0
+        teacher_loss_sum = teacher_coverage_sum = 0.0
         lr = optimizer.param_groups[0]['lr']
         for image, target, _ in train_loader:
             image, target = image.cuda(), target.cuda()
@@ -115,6 +149,13 @@ def main():
             if not torch.isfinite(prob).all():
                 raise FloatingPointError('Non-finite training output at epoch {}'.format(epoch))
             loss = segmentation_loss(prob, target, args.boundary_weight)
+            if teacher is not None:
+                with torch.no_grad():
+                    teacher_prob = teacher(image)
+                regularizer, coverage = teacher_constraint(prob, teacher_prob, target, args.teacher_confidence)
+                loss = loss + args.teacher_weight * regularizer
+                teacher_loss_sum += regularizer.item() * len(image)
+                teacher_coverage_sum += coverage.item() * len(image)
             if not torch.isfinite(loss):
                 raise FloatingPointError('Non-finite loss at epoch {}'.format(epoch))
             loss.backward()
@@ -126,6 +167,9 @@ def main():
         scheduler.step()
         row = dict(epoch=epoch, lr=lr, train_loss=train_loss / len(train_ds),
                    **metrics, seconds=time.monotonic() - started)
+        if teacher is not None:
+            row.update(teacher_kl=teacher_loss_sum / len(train_ds),
+                       teacher_coverage=teacher_coverage_sum / len(train_ds))
         history.append(row)
         if metrics['pooled_dice'] > best:
             best = metrics['pooled_dice']

@@ -118,7 +118,7 @@ def test_preprocessing_binary_masks_and_constant_images(tmp_path):
     assert name == 'image.png'
 
 
-@pytest.mark.parametrize('variant', ['original', 'refine', 'multiscale', 'context'])
+@pytest.mark.parametrize('variant', ['original', 'refine', 'multiscale', 'context', 'teacher'])
 def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, variant):
     """Exercise the real runner loop with a tiny CPU model, including RNG restoration."""
     import sys
@@ -127,7 +127,7 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
     import train_full
     import fullsup.runtime as runtime
     output_refine = variant == 'refine'
-    decoder = variant if variant in ('multiscale', 'context') else 'original'
+    decoder = 'context' if variant == 'teacher' else variant if variant in ('multiscale', 'context') else 'original'
     for split in ('train', 'val'):
         for folder in ('images', 'masks'):
             (tmp_path / split / folder).mkdir(parents=True)
@@ -176,13 +176,28 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
                 logits = logits + adapter(decoded, context)
             return logits.sigmoid()
 
-    def build(_, output_refine=False, decoder='original'):
+    def build(_=None, output_refine=False, decoder='original'):
         result = TinyModel(decoder)
         if output_refine:
             runtime.enable_output_refinement(result)
         return result
 
     monkeypatch.setattr(runtime, 'build_model', build)
+    if variant == 'teacher':
+        # Exercise the real runner with a small teacher; real B0 loading is tested separately.
+        import copy
+        source_path = tmp_path / 'baseline.pth'
+        torch.save(build().state_dict(), source_path)
+        def initialize(checkpoint, config, with_teacher):
+            teacher = build()
+            teacher.load_state_dict(torch.load(checkpoint, weights_only=True))
+            teacher.eval().requires_grad_(False)
+            student = copy.deepcopy(teacher).requires_grad_(True)
+            from models.vmunet.context_adapter import ContextAdapter
+            with torch.random.fork_rng(devices=[]):
+                student.vmunet.context_adapter = ContextAdapter([3, 3, 3, 3], 1)
+            return student, teacher
+        monkeypatch.setattr(runtime, 'initialize_from_baseline', initialize)
     original_validate = runtime.validate
     monkeypatch.setattr(runtime, 'validate', lambda model, loader, device: original_validate(model, loader, 'cpu'))
     # CPU DataLoader must not attempt to allocate CUDA-pinned memory.
@@ -195,6 +210,7 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
             '--manifest', str(manifest_path), '--output', str(tmp_path / name),
             '--epochs', '2', '--batch-size', '2', '--size', '32'] +
             ['--decoder', decoder] + (['--output-refine'] if output_refine else []) +
+            (['--init-checkpoint', str(source_path), '--teacher-weight', '1'] if variant == 'teacher' else []) +
             (['--resume'] if resume else []))
         train_full.main()
 
@@ -225,6 +241,23 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
     assert len(resumed['history']) == 2
 
 
+def test_teacher_mask_and_gradients():
+    import torch
+    from fullsup.runtime import teacher_constraint
+    q = torch.tensor([.99, .01, .99, .55], requires_grad=True)
+    p = torch.tensor([.8, .2, .3, .3], requires_grad=True)
+    target = torch.tensor([1., 0., 0., 1.])
+    loss, coverage = teacher_constraint(p, q, target)
+    loss.backward()
+    assert coverage == .5 and q.grad is None
+    assert p.grad[0] < 0 and p.grad[1] > 0
+    assert torch.equal(p.grad[2:], torch.zeros(2))
+    same, _ = teacher_constraint(q.detach(), q, target)
+    assert abs(same.item()) < 1e-7
+    empty, fraction = teacher_constraint(p, torch.full_like(q, .5), target)
+    assert empty.item() == 0 and fraction == 0
+
+
 def test_context_preserves_backbone_and_learns_all_paths(tmp_path, monkeypatch):
     import torch
     from models.vmunet import vmamba
@@ -242,6 +275,20 @@ def test_context_preserves_backbone_and_learns_all_paths(tmp_path, monkeypatch):
     image = torch.rand(1, 3, 32, 64) * 255
     with torch.no_grad():
         assert torch.equal(model(image), baseline(image))
+    from fullsup.runtime import initialize_from_baseline
+    config = dict(decoder='original', seed=43, size=32, preprocessing='corrected', manifest_sha256='test')
+    source = tmp_path / 'baseline.pth'
+    torch.save(dict(model_state_dict=baseline.state_dict(), config=config), source)
+    student, teacher = initialize_from_baseline(source, dict(config, decoder='context'), True)
+    student.eval()
+    with torch.no_grad():
+        assert torch.equal(student(image), teacher(image))
+        assert torch.equal(teacher(image), baseline(image))
+    assert not teacher.training and not any(p.requires_grad for p in teacher.parameters())
+    assert all(p.requires_grad for p in student.parameters())
+    with pytest.raises(ValueError, match='manifest_sha256'):
+        initialize_from_baseline(source, dict(config, manifest_sha256='different'), True)
+    del student, teacher
     del baseline
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     target = torch.rand(1, 1, 32, 64).round()

@@ -175,6 +175,38 @@ def atomic_save(state, path):
     os.replace(temporary, path)
 
 
+def teacher_constraint(student, teacher, target, confidence=0.9):
+    """Class-balanced Bernoulli KL on correct, confident training pixels only."""
+    if not 0.5 < confidence < 1:
+        raise ValueError('Teacher confidence must be between 0.5 and 1')
+    teacher = teacher.detach()
+    if not torch.isfinite(teacher).all():
+        raise FloatingPointError('Non-finite teacher prediction')
+    truth = target >= 0.5
+    selected = ((teacher >= 0.5) == truth) & (torch.maximum(teacher, 1 - teacher) >= confidence)
+    p, q = student.clamp(1e-6, 1 - 1e-6), teacher.clamp(1e-6, 1 - 1e-6)
+    kl = q * (q.log() - p.log()) + (1 - q) * ((1 - q).log() - (1 - p).log())
+    terms = [kl[mask].mean() for mask in (selected & truth, selected & ~truth) if mask.any()]
+    return (torch.stack(terms).mean() if terms else student.sum() * 0), selected.float().mean()
+
+
+def initialize_from_baseline(checkpoint, config, with_teacher=False):
+    """Load a controlled B0 before attaching zero-initialized context residuals."""
+    import copy
+    model = build_model()
+    source = load_weights(model, checkpoint)
+    if not source or source.get('decoder', 'original') != 'original' or source.get('output_refine', False):
+        raise ValueError('Initialization requires a controlled original B0 checkpoint')
+    if source.get('boundary_weight', 0) != 0:
+        raise ValueError('Initialization requires B0 without boundary weighting')
+    for key in ('manifest_sha256', 'size', 'preprocessing', 'seed'):
+        if source.get(key) != config.get(key):
+            raise ValueError('Baseline checkpoint mismatch: ' + key)
+    teacher = copy.deepcopy(model).eval().requires_grad_(False) if with_teacher else None
+    configure_decoder(model, config['decoder'])
+    return model, teacher
+
+
 def write_json(path, value):
     Path(path).write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + '\n')
 

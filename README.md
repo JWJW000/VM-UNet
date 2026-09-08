@@ -94,15 +94,17 @@ python -m pytest -q tests
 
 The completed three-seed baseline scored **89.53% ± 0.57%** validation pooled Dice; fixed boundary weighting scored **89.50% ± 0.62%**, so that probe is paused.
 
-Current candidate: **R3 context recovery** (`--decoder context`). It retains the original pretrained Mamba encoder, decoder and output head, adds joint four-scale context to three skip connections, and learns progressive high-resolution residual logits. Zero-initialized residual outputs preserve the original initial prediction. R2 completed seeds 42/43 changed Dice by +0.9890/−1.3780 percentage points; no stable gain is established.
+Current candidate: **R4 baseline-initialized context model with a frozen B0 teacher**. R3 seed43 finished at 89.5243% Dice versus B0 89.9648%; no gain was established. R4 loads the trained B0 before attaching zero-initialized context paths, then adds a class-balanced KL constraint only on correct, confident teacher predictions on training images.
 
 ```bash
 python train_full.py --data-path data/isic2018 \
-  --manifest splits/full_isic18_legacy.json --output results/full_context_s43 \
-  --decoder context --seed 43 --epochs 300 --gpu 0
+  --manifest splits/full_isic18_legacy.json --output results/full_teacher_s43 \
+  --init-checkpoint results/full_b0_s43/best.pth --decoder context \
+  --teacher-weight 1 --teacher-confidence 0.9 --seed 43 \
+  --epochs 100 --lr 0.0001 --gpu 0
 ```
 
-See the [roadmap](docs/后续研究路线.md) for design evidence, the CUDA smoke test and full 300-epoch training commands. R3 has not been evaluated on the GPU yet. Evaluation reconstructs the model from checkpoint configuration; original/R1/R2 remain available for historical checkpoints. Do not combine R1 output refinement with a custom decoder.
+Use the [roadmap](docs/后续研究路线.md) for the required same-step B0 continuation control and CUDA smoke test. R4 is unverified on GPU. Both groups retain epoch-zero best predictions; retaining that score is not an improvement. Teacher inference adds memory and compute during training only. Historical original/R1/R2/R3 checkpoints remain supported.
 
 The earlier scan-aware semi-supervised scripts (`train_ssl.py`, `eval_cross_domain.py`) remain available as historical experiments. Their direction is paused; see the [archived plan](docs/archive/扫描半监督路线_已暂停.md).
 
