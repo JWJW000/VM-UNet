@@ -6,7 +6,9 @@ Image Segmentation". {[Arxiv Paper](https://arxiv.org/abs/2402.02491)}
 
 已接入完整官方模型：`models/mambalite.py`；训练选择 `--model mambalite`。
 来源与固定版本见 [模型来源](models/MAMBALITE_SOURCE.md)，实验条件见 [研究路线第 5.3 节](docs/后续研究路线.md)。
-在保留原数据和冻结清单的 GPU 仓库中，激活已有 `vmunet` 环境后运行：
+训练已在运行时，监控智能体先阅读 [GPU 后续执行计划](docs/GPU后续执行计划.md)，不要重复启动下面的脚本。
+
+首次启动时，在保留原数据和冻结清单的 GPU 仓库中，激活已有 `vmunet` 环境后运行：
 
 ```bash
 git pull --ff-only origin main
