@@ -94,17 +94,17 @@ python -m pytest -q tests
 
 The completed three-seed baseline scored **89.53% ± 0.57%** validation pooled Dice; fixed boundary weighting scored **89.50% ± 0.62%**, so that probe is paused.
 
-Current candidate: **R4 baseline-initialized context model with a frozen B0 teacher**. R3 seed43 finished at 89.5243% Dice versus B0 89.9648%; no gain was established. R4 loads the trained B0 before attaching zero-initialized context paths, then adds a class-balanced KL constraint only on correct, confident teacher predictions on training images.
+Next experiment: **B0-initialized context model without a teacher**. Completed seed43 R4 reached 90.1126% validation Dice versus the B0 continuation control's retained initial 89.9648%. The small gain occurred in only one of 100 epochs, and boundary F1 decreased. This control isolates the teacher's incremental effect under the same initialization and training settings.
 
 ```bash
 python train_full.py --data-path data/isic2018 \
-  --manifest splits/full_isic18_legacy.json --output results/full_teacher_s43 \
+  --manifest splits/full_isic18_legacy.json --output results/full_context_continue_s43 \
   --init-checkpoint results/full_b0_s43/best.pth --decoder context \
-  --teacher-weight 1 --teacher-confidence 0.9 --seed 43 \
-  --epochs 100 --lr 0.0001 --gpu 0
+  --teacher-weight 0 --teacher-confidence 0.9 --seed 43 \
+  --epochs 100 --batch-size 32 --lr 0.0001 --gpu 0
 ```
 
-Use the [roadmap](docs/后续研究路线.md) for the required same-step B0 continuation control and CUDA smoke test. R4 is unverified on GPU. Both groups retain epoch-zero best predictions; retaining that score is not an improvement. Teacher inference adds memory and compute during training only. Historical original/R1/R2/R3 checkpoints remain supported.
+Teacher weight zero already disables teacher construction and inference. Reuse the two completed controls; do not retrain them. See [roadmap section 5.2](docs/后续研究路线.md#52-下一步-b0-初始化的-r3-无教师对照) for results, analysis and resume instructions. All three groups retain epoch-zero best predictions, which must not be counted as a new gain.
 
 The earlier scan-aware semi-supervised scripts (`train_ssl.py`, `eval_cross_domain.py`) remain available as historical experiments. Their direction is paused; see the [archived plan](docs/archive/扫描半监督路线_已暂停.md).
 

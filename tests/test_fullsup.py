@@ -289,6 +289,12 @@ def test_context_preserves_backbone_and_learns_all_paths(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match='manifest_sha256'):
         initialize_from_baseline(source, dict(config, manifest_sha256='different'), True)
     del student, teacher
+    control, teacher = initialize_from_baseline(source, dict(config, decoder='context'), False)
+    assert teacher is None
+    control.eval()
+    with torch.no_grad():
+        assert torch.equal(control(image), baseline(image))
+    del control
     del baseline
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     target = torch.rand(1, 1, 32, 64).round()
