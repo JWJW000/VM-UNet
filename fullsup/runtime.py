@@ -130,7 +130,16 @@ def configure_decoder(model, decoder):
         del backbone.layers_up, backbone.final_up, backbone.final_conv
 
 
-def build_model(pretrained=None, output_refine=False, decoder='original'):
+def build_model(pretrained=None, output_refine=False, decoder='original', model_name='vmunet'):
+    if model_name == 'mambalite':
+        if pretrained or output_refine or decoder != 'original':
+            raise ValueError('MambaLite uses its own random initialization and complete architecture')
+        from models.mambalite import MambaLiteUNet
+        model = MambaLiteUNet(num_classes=1, input_channels=3)
+        model.architecture = 'mambalite'
+        return model
+    if model_name != 'vmunet':
+        raise ValueError('Unknown model: ' + str(model_name))
     if decoder != 'original' and output_refine:
         raise ValueError('Custom decoder and R1 output refinement are separate experiments')
     from models.vmunet.vmunet import VMUNet
@@ -148,16 +157,22 @@ def build_model(pretrained=None, output_refine=False, decoder='original'):
 def load_weights(model, checkpoint):
     # Only load trusted, user-owned checkpoints: legacy torch.load uses pickle.
     try:
-        state = torch.load(checkpoint, map_location='cpu', weights_only=False)
+        state = checkpoint if isinstance(checkpoint, dict) else torch.load(checkpoint, map_location='cpu', weights_only=False)
     except TypeError as error:
         if 'weights_only' not in str(error):
             raise
         state = torch.load(checkpoint, map_location='cpu')
     config = state.get('config', {})
+    architecture = config.get('model', 'vmunet')
+    if architecture != getattr(model, 'architecture', 'vmunet'):
+        raise ValueError('Checkpoint architecture differs from model: ' + architecture)
     decoder = config.get('decoder', 'original')
+    if architecture == 'mambalite' and (decoder != 'original' or config.get('output_refine', False)):
+        raise ValueError('MambaLite checkpoint has incompatible VM-UNet options')
     if decoder != 'original' and config.get('output_refine', False):
         raise ValueError('Incompatible decoder and output_refine checkpoint configuration')
-    configure_decoder(model, decoder)
+    if architecture == 'vmunet':
+        configure_decoder(model, decoder)
     if config.get('output_refine', False):
         enable_output_refinement(model)
     payload = state.get('model_state_dict', state)

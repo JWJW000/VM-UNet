@@ -118,7 +118,7 @@ def test_preprocessing_binary_masks_and_constant_images(tmp_path):
     assert name == 'image.png'
 
 
-@pytest.mark.parametrize('variant', ['original', 'refine', 'multiscale', 'context', 'teacher'])
+@pytest.mark.parametrize('variant', ['original', 'refine', 'multiscale', 'context', 'teacher', 'mambalite'])
 def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, variant):
     """Exercise the real runner loop with a tiny CPU model, including RNG restoration."""
     import sys
@@ -141,6 +141,8 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
     manifest_path.write_text(json.dumps(make_manifest(tmp_path)))
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(torch.cuda, 'get_device_name', lambda _: 'CPU test double')
+    monkeypatch.setattr(torch.cuda, 'reset_peak_memory_stats', lambda: None)
+    monkeypatch.setattr(torch.cuda, 'max_memory_allocated', lambda: 0)
     monkeypatch.setattr(torch.cuda, 'get_rng_state_all', lambda: [])
     monkeypatch.setattr(torch.cuda, 'set_rng_state_all', lambda _: None)
     monkeypatch.setattr(torch.Tensor, 'cuda', lambda self, *a, **kw: self)
@@ -176,7 +178,7 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
                 logits = logits + adapter(decoded, context)
             return logits.sigmoid()
 
-    def build(_=None, output_refine=False, decoder='original'):
+    def build(_=None, output_refine=False, decoder='original', model_name='vmunet'):
         result = TinyModel(decoder)
         if output_refine:
             runtime.enable_output_refinement(result)
@@ -209,7 +211,7 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
         monkeypatch.setattr(sys, 'argv', ['train_full.py', '--data-path', str(tmp_path),
             '--manifest', str(manifest_path), '--output', str(tmp_path / name),
             '--epochs', '2', '--batch-size', '2', '--size', '32'] +
-            ['--decoder', decoder] + (['--output-refine'] if output_refine else []) +
+            ['--decoder', decoder, '--model', 'mambalite' if variant == 'mambalite' else 'vmunet'] + (['--output-refine'] if output_refine else []) +
             (['--init-checkpoint', str(source_path), '--teacher-weight', '1'] if variant == 'teacher' else []) +
             (['--resume'] if resume else []))
         train_full.main()
@@ -337,7 +339,8 @@ def test_legacy_eval_matches_original_normalize_resize(tmp_path):
     assert torch.equal(y, old_y)
 
 
-def test_analysis_exports_csv_summary_and_worst_panels(tmp_path, monkeypatch):
+@pytest.mark.parametrize('architecture', ['vmunet', 'mambalite'])
+def test_analysis_exports_csv_summary_and_worst_panels(tmp_path, monkeypatch, architecture):
     import sys
     import torch
     from PIL import Image
@@ -350,10 +353,15 @@ def test_analysis_exports_csv_summary_and_worst_panels(tmp_path, monkeypatch):
         Image.fromarray(image).save(tmp_path / 'val/images' / '{}.png'.format(index))
         Image.fromarray((image[:, :, 0] > 128).astype(np.uint8) * 255).save(
             tmp_path / 'val/masks' / '{}.png'.format(index))
-    def build():
-        return torch.nn.Sequential(torch.nn.Conv2d(3, 1, 1), torch.nn.Sigmoid())
+    def build(model_name='vmunet'):
+        model = torch.nn.Sequential(torch.nn.Conv2d(3, 1, 1), torch.nn.Sigmoid())
+        model.architecture = model_name
+        return model
     ckpt = tmp_path / 'model.pth'
-    torch.save(build().state_dict(), ckpt)
+    state = build().state_dict()
+    if architecture == 'mambalite':
+        state = dict(model_state_dict=state, config=dict(model=architecture, size=32, preprocessing='corrected'))
+    torch.save(state, ckpt)
     monkeypatch.setattr(runtime, 'build_model', build)
     monkeypatch.setattr(torch.Tensor, 'cuda', lambda self, *a, **kw: self)
     monkeypatch.setattr(torch.nn.Module, 'cuda', lambda self, *a, **kw: self)
@@ -454,3 +462,56 @@ def test_multiscale_decoder_end_to_end_and_checkpoint(tmp_path, monkeypatch):
         assert torch.equal(restored(image), model(image))
     with pytest.raises(ValueError, match='separate experiments'):
         build_model(output_refine=True, decoder='multiscale')
+
+
+def test_mambalite_wiring_checkpoint_and_cli(tmp_path, monkeypatch):
+    """Real upstream architecture; Mamba replaced explicitly for CPU wiring only."""
+    import sys
+    import types
+    import torch
+    import train_full
+    from fullsup.runtime import build_model, load_weights, segmentation_loss
+
+    class CPUMambaStub(torch.nn.Module):
+        def __init__(self, d_model, **kwargs):
+            super().__init__()
+            self.proj = torch.nn.Linear(d_model, d_model)
+
+        def forward(self, x):
+            return self.proj(x)
+
+    monkeypatch.setitem(sys.modules, 'mamba_ssm', types.SimpleNamespace(Mamba=CPUMambaStub))
+    monkeypatch.delitem(sys.modules, 'models.mambalite', raising=False)
+    model = build_model(model_name='mambalite')
+    image = torch.rand(2, 3, 64, 64) * 255
+    target = (torch.rand(2, 1, 64, 64) > 0.5).float()
+    probability = model(image)
+    assert probability.shape == target.shape
+    assert torch.isfinite(probability).all()
+    assert probability.min() >= 0 and probability.max() <= 1
+    loss = segmentation_loss(probability, target)
+    loss.backward()
+    # Check both encoding and decoding, not just a detached output head.
+    for layer in (model.encoder1[0], model.encoder4.proj, model.decoder1.proj, model.final):
+        assert layer.weight.grad is not None
+        assert torch.isfinite(layer.weight.grad).all() and layer.weight.grad.abs().sum() > 0
+    model.eval()
+    path = tmp_path / 'lite.pth'
+    torch.save(dict(model_state_dict=model.state_dict(), config={'model': 'mambalite'}), path)
+    restored = build_model(model_name='mambalite').eval()
+    assert load_weights(restored, path)['model'] == 'mambalite'
+    with torch.no_grad():
+        assert torch.equal(model(image), restored(image))
+    with pytest.raises(ValueError, match='architecture'):
+        load_weights(torch.nn.Identity(), path)
+    with pytest.raises(ValueError, match='random initialization'):
+        build_model(pretrained='wrong.pth', model_name='mambalite')
+    arguments = ['train_full.py', '--data-path', 'data', '--manifest', 'split',
+                 '--output', 'out', '--model', 'mambalite']
+    monkeypatch.setattr(sys, 'argv', arguments)
+    assert train_full.parse_args().pretrained is None
+    monkeypatch.setattr(sys, 'argv', arguments + ['--decoder', 'context'])
+    with pytest.raises(SystemExit):
+        train_full.parse_args()
+    # Do not leak the stub-backed imported class to any later test.
+    sys.modules.pop('models.mambalite', None)

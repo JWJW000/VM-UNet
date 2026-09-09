@@ -35,8 +35,10 @@ def main():
     from fullsup.runtime import SegmentationDataset, build_model, load_weights, seed_everything, write_json
     seed_everything(42)
     pairs = load_manifest(args.data_path, args.manifest)['val'] if args.manifest else pairs_in(args.data_path, args.split)
-    model = build_model()
-    config = load_weights(model, args.ckpt)
+    state = torch.load(args.ckpt, map_location='cpu', weights_only=False)
+    architecture = state.get('config', {}).get('model', 'vmunet')
+    model = build_model() if architecture == 'vmunet' else build_model(model_name=architecture)
+    config = load_weights(model, state)
     preprocessing = args.preprocessing or config.get('preprocessing', 'legacy')
     size = args.size or config.get('size', 256)
     if config and (size != config['size'] or preprocessing != config['preprocessing']):
@@ -68,7 +70,7 @@ def main():
         writer.writeheader()
         writer.writerows(sorted(rows, key=lambda r: r['dice']))
     summary = summarize(rows)
-    summary.update(checkpoint=str(Path(args.ckpt).resolve()), preprocessing=preprocessing, size=size,
+    summary.update(model=architecture, checkpoint=str(Path(args.ckpt).resolve()), preprocessing=preprocessing, size=size,
                    output_refine=config.get('output_refine', False),
                    decoder=config.get('decoder', 'original'),
                    threshold=0.5, boundary_tolerance_px=args.boundary_tolerance,
