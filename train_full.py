@@ -34,7 +34,23 @@ def parse_args():
     parser.add_argument('--init-checkpoint', help='Controlled B0 checkpoint for a new continuation experiment')
     parser.add_argument('--teacher-weight', type=float, default=0.0, help='Correct/confident training-pixel KL weight; 0 disables teacher')
     parser.add_argument('--teacher-confidence', type=float, default=0.9)
+    parser.add_argument('--bcp', action='store_true', help='Binary bidirectional region-mixing adaptation')
+    parser.add_argument('--unlabeled-split', help='Frozen SSL split; also checked for the supervised control')
+    parser.add_argument('--bcp-pseudo-weight', type=float, default=0.5)
+    parser.add_argument('--expected-initial-dice', type=float, help='Require starting validation Dice within 1e-6')
     args = parser.parse_args()
+    if args.bcp or args.unlabeled_split:
+        if (not args.init_checkpoint or args.model != 'vmunet' or args.decoder != 'original'
+                or args.output_refine or args.boundary_weight or args.teacher_weight
+                or args.preprocessing != 'corrected'):
+            parser.error('Few-label comparison requires original VM-UNet initialization, corrected data and no prior variants')
+    if args.bcp and not args.unlabeled_split:
+        parser.error('--bcp requires --unlabeled-split')
+    if not 0 < args.bcp_pseudo_weight < float('inf'):
+        parser.error('BCP pseudo weight must be finite and positive')
+    if args.expected_initial_dice is not None and (not args.init_checkpoint or not 0 <= args.expected_initial_dice <= 1):
+        parser.error('Expected initial Dice requires initialization and a value in [0,1]')
+
     if args.model == 'mambalite':
         if (args.pretrained or args.init_checkpoint or args.teacher_weight or
                 args.decoder != 'original' or args.output_refine or args.boundary_weight):
@@ -75,6 +91,18 @@ def main():
     output = Path(args.output)
     config = vars(args).copy()
     config.pop('resume')
+    if args.unlabeled_split:
+        from fullsup.bcp import load_unlabeled
+        unlabeled_pairs = load_unlabeled(args.data_path, manifest, args.unlabeled_split, args.seed)
+        config['unlabeled_split_sha256'] = hashlib.sha256(Path(args.unlabeled_split).read_bytes()).hexdigest()
+        config['n_labeled'], config['n_unlabeled'] = len(manifest['train']), len(unlabeled_pairs)
+        source_paths = ['train_full.py', 'fullsup/runtime.py', 'fullsup/data.py', 'fullsup/bcp.py',
+                        'models/vmunet/vmunet.py', 'models/vmunet/vmamba.py',
+                        'models/vmunet/scan_utils.py', 'scan_ssl/ema.py']
+        config['training_source_sha256'] = {name: hashlib.sha256(
+            (Path(__file__).parent / name).read_bytes()).hexdigest() for name in source_paths}
+    if args.bcp:
+        config['bcp_source_sha256'] = hashlib.sha256((Path(__file__).parent / 'fullsup/bcp.py').read_bytes()).hexdigest()
     if args.model == 'mambalite':
         config['model_sha256'] = hashlib.sha256(
             (Path(__file__).parent / 'models/mambalite.py').read_bytes()).hexdigest()
@@ -87,6 +115,8 @@ def main():
         config['init_sha256'] = digest.hexdigest()
     if args.resume:
         saved_config = json.loads((output / 'config.json').read_text())
+        for key, value in dict(bcp=False, unlabeled_split=None, bcp_pseudo_weight=0.5, expected_initial_dice=None).items():
+            saved_config.setdefault(key, value)
         saved_config.setdefault('model', 'vmunet')
         saved_config.setdefault('output_refine', False)
         saved_config.setdefault('decoder', 'original')
@@ -99,6 +129,12 @@ def main():
         output.mkdir(parents=True, exist_ok=False)
         write_json(output / 'config.json', config)
         write_json(output / 'manifest.json', manifest)
+        if args.unlabeled_split:
+            import zipfile
+            with zipfile.ZipFile(output / 'source_snapshot.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
+                for name in source_paths:
+                    archive.write(Path(__file__).parent / name, name)
+            write_json(output / 'unlabeled_split.json', json.loads(Path(args.unlabeled_split).read_text()))
         revision = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True)
         dirty = subprocess.run(['git', 'status', '--porcelain'], capture_output=True, text=True)
         import torchvision
@@ -106,7 +142,7 @@ def main():
                    cuda=torch.version.cuda, gpu=torch.cuda.get_device_name(0),
                    git_commit=revision.stdout.strip(), git_status=dirty.stdout.strip(),
                    selection='maximum validation pooled_dice, threshold=0.5',
-                   note='All training masks used. Validation is not an independent test.'))
+                   note='Only manifest train masks are used. Validation is not an independent test.'))
     seed_everything(args.seed)
     train_ds = SegmentationDataset(args.data_path, manifest['train'], args.size, True, args.preprocessing)
     val_ds = SegmentationDataset(args.data_path, manifest['val'], args.size, False, args.preprocessing)
@@ -115,9 +151,17 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=0, pin_memory=True, generator=generator)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
+    unlabeled_ds = None
+    if args.bcp:
+        from fullsup.bcp import sample_unlabeled, bcp_backward
+        from scan_ssl.ema import update_ema
+        # Preserve the labeled augmentation stream between method and control.
+        rng_before = random.getstate()
+        unlabeled_ds = SegmentationDataset(args.data_path, unlabeled_pairs, args.size, True, args.preprocessing)
+        random.setstate(rng_before)
     teacher = None
     if args.init_checkpoint:
-        model, teacher = initialize_from_baseline(args.init_checkpoint, config, bool(args.teacher_weight))
+        model, teacher = initialize_from_baseline(args.init_checkpoint, config, bool(args.teacher_weight) or args.bcp)
         if teacher is not None:
             teacher = teacher.cuda()
     else:
@@ -141,49 +185,63 @@ def main():
         torch.set_rng_state(state['rng_torch'])
         torch.cuda.set_rng_state_all(state['rng_cuda'])
         generator.set_state(state['rng_loader'])
+        if args.bcp:
+            teacher.load_state_dict(state['teacher_state_dict'], strict=True)
     elif args.init_checkpoint:
         # Both the continuation control and proposed method retain their starting best.
         metrics = validate(model, val_loader, 'cuda')
+        write_json(output / 'initial_metrics.json', metrics)
+        if args.expected_initial_dice is not None and abs(metrics['pooled_dice'] - args.expected_initial_dice) > 1e-6:
+            raise ValueError('Initial Dice mismatch; inspect code/data before training: ' + str(metrics['pooled_dice']))
         best = metrics['pooled_dice']
         atomic_save(dict(model_state_dict=model.state_dict(), config=config, epoch=0,
                          metrics=metrics), output / 'best.pth')
-        write_json(output / 'initial_metrics.json', metrics)
     for epoch in range(start, args.epochs + 1):
         started = time.monotonic()
         model.train()
-        if args.model == 'mambalite':
+        if args.model == 'mambalite' or args.unlabeled_split:
             torch.cuda.reset_peak_memory_stats()
         train_loss = 0.0
         teacher_loss_sum = teacher_coverage_sum = 0.0
         lr = optimizer.param_groups[0]['lr']
-        for image, target, _ in train_loader:
+        for batch_index, (image, target, _) in enumerate(train_loader):
             image, target = image.cuda(), target.cuda()
             optimizer.zero_grad(set_to_none=True)
-            prob = model(image)
-            if not torch.isfinite(prob).all():
-                raise FloatingPointError('Non-finite training output at epoch {}'.format(epoch))
-            loss = segmentation_loss(prob, target, args.boundary_weight)
-            if teacher is not None:
-                with torch.no_grad():
-                    teacher_prob = teacher(image)
-                regularizer, coverage = teacher_constraint(prob, teacher_prob, target, args.teacher_confidence)
-                loss = loss + args.teacher_weight * regularizer
-                teacher_loss_sum += regularizer.item() * len(image)
-                teacher_coverage_sum += coverage.item() * len(image)
-            if not torch.isfinite(loss):
-                raise FloatingPointError('Non-finite loss at epoch {}'.format(epoch))
-            loss.backward()
-            # Detect invalid gradients without clipping/changing the baseline optimization.
+            if args.bcp:
+                step_seed = args.seed * 1000003 + (epoch - 1) * len(train_loader) + batch_index
+                unlabeled = sample_unlabeled(unlabeled_ds, len(image), step_seed).cuda()
+                loss_value = bcp_backward(model, teacher, image, target, unlabeled, step_seed, args.bcp_pseudo_weight)
+            else:
+                prob = model(image)
+                if not torch.isfinite(prob).all():
+                    raise FloatingPointError('Non-finite training output at epoch {}'.format(epoch))
+                loss = segmentation_loss(prob, target, args.boundary_weight)
+                if teacher is not None:
+                    with torch.no_grad():
+                        teacher_prob = teacher(image)
+                    regularizer, coverage = teacher_constraint(prob, teacher_prob, target, args.teacher_confidence)
+                    loss = loss + args.teacher_weight * regularizer
+                    teacher_loss_sum += regularizer.item() * len(image)
+                    teacher_coverage_sum += coverage.item() * len(image)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError('Non-finite loss at epoch {}'.format(epoch))
+                loss.backward()
+                loss_value = loss.item()
+            # Detect invalid gradients without clipping/changing optimization.
             torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'), error_if_nonfinite=True)
             optimizer.step()
-            train_loss += loss.item() * len(image)
+            if args.bcp:
+                update_ema(model, teacher, 0.99)
+            train_loss += loss_value * len(image)
         metrics = validate(model, val_loader, 'cuda')
         scheduler.step()
         row = dict(epoch=epoch, lr=lr, train_loss=train_loss / len(train_ds),
                    **metrics, seconds=time.monotonic() - started)
-        if args.model == 'mambalite':
+        if args.model == 'mambalite' or args.unlabeled_split:
             row['peak_cuda_memory_mb'] = torch.cuda.max_memory_allocated() / (1024 ** 2)
-        if teacher is not None:
+        if args.unlabeled_split:
+            row['optimizer_updates'] = epoch * len(train_loader)
+        if teacher is not None and not args.bcp:
             row.update(teacher_kl=teacher_loss_sum / len(train_ds),
                        teacher_coverage=teacher_coverage_sum / len(train_ds))
         history.append(row)
@@ -191,7 +249,8 @@ def main():
             best = metrics['pooled_dice']
             atomic_save(dict(model_state_dict=model.state_dict(), config=config, epoch=epoch,
                              metrics=metrics), output / 'best.pth')
-        atomic_save(dict(epoch=epoch, best_dice=best, model_state_dict=model.state_dict(),
+        atomic_save(dict(**({'teacher_state_dict': teacher.state_dict()} if args.bcp else {}),
+                         epoch=epoch, best_dice=best, model_state_dict=model.state_dict(),
                          optimizer_state_dict=optimizer.state_dict(), scheduler_state_dict=scheduler.state_dict(),
                          config=config, history=history, rng_python=random.getstate(), rng_numpy=np.random.get_state(),
                          rng_torch=torch.get_rng_state(), rng_cuda=torch.cuda.get_rng_state_all(),

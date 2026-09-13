@@ -2,22 +2,21 @@
 This is the official code repository for "VM-UNet: Vision Mamba UNet for Medical
 Image Segmentation". {[Arxiv Paper](https://arxiv.org/abs/2402.02491)}
 
-## 当前实验：MambaLiteUNet 全监督对照
+## 当前实验：10%标注的 BCP 区域混合验证
 
-已接入完整官方模型：`models/mambalite.py`；训练选择 `--model mambalite`。
-来源与固定版本见 [模型来源](models/MAMBALITE_SOURCE.md)，实验条件见 [研究路线第 5.3 节](docs/后续研究路线.md)。
-训练已在运行时，监控智能体先阅读 [GPU 后续执行计划](docs/GPU后续执行计划.md)，不要重复启动下面的脚本。
+MambaLiteUNet 已放弃，旧扫描半监督队列停止扩展。当前保留VM-UNet，复用Dice=86.9841%的少标注监督权重，对比纯监督继续训练与BCP双向区域混合。
 
-首次启动时，在保留原数据和冻结清单的 GPU 仓库中，激活已有 `vmunet` 环境后运行：
+[完整方案与部署命令](docs/BCP少标注验证方案.md) · [监控智能体执行入口](docs/GPU后续执行计划.md) · [最新结果核对](docs/SSL结果核对与下一步_2026-09-13.md)
+
+准备好固定权重、manifest和SSL split后，在原CUDA/Mamba环境执行：
 
 ```bash
-git pull --ff-only origin main
 conda activate vmunet
-nohup bash run_mambalite.sh > mambalite_s43.log 2>&1 &
-tail -f mambalite_s43.log
+nohup bash run_bcp10.sh > bcp10.log 2>&1 &
+tail -f bcp10.log
 ```
 
-脚本先做一轮 CUDA 检查及权重重载，再从随机初始化训练 seed43 共 300 轮，最后评估最佳权重。任一步失败即停止；不覆盖旧结果，不自动改变 batch。正式输出：`results/full_mambalite_s43`。本机 34 项测试通过，其中模型接线使用显式 CPU Mamba 替身，尚无本项目的真实 CUDA 结果或提升结论。
+服务器存在未提交代码时，按方案建立独立目录，不直接覆盖。脚本先检查指纹、复现初始Dice及CUDA烟测，再分别运行两组1800次更新，最后评估并汇总；任何阶段失败就停止后续阶段。39项CPU测试通过，尚未在GPU证明适配效果。
 
 ## Abstract
 In the realm of medical image segmentation, both CNN-based and Transformer-based models have been extensively explored. However, CNNs exhibit limitations in long-range modeling capabilities, whereas Transformers are hampered by their quadratic computational complexity. Recently, State Space Models (SSMs), exemplified by Mamba, have emerged as a promising approach. They not only excel in modeling long-range interactions but also maintain a linear computational complexity. In this paper, leveraging state space models, we propose a U-shape architecture model for medical image segmentation, named Vision Mamba UNet (VM-UNet). Specifically, the Visual State Space (VSS) block is introduced as the foundation block to capture extensive contextual information, and an asymmetrical encoder-decoder structure is constructed. We conduct comprehensive experiments on the ISIC17, ISIC18, and Synapse datasets, and the results indicate that VM-UNet performs competitively in medical image segmentation tasks. To our best knowledge, this is the first medical image segmentation model constructed based on the pure SSM-based model. We aim to establish a baseline and provide valuable insights for the future development of more efficient and effective SSM-based segmentation systems.

@@ -118,7 +118,7 @@ def test_preprocessing_binary_masks_and_constant_images(tmp_path):
     assert name == 'image.png'
 
 
-@pytest.mark.parametrize('variant', ['original', 'refine', 'multiscale', 'context', 'teacher', 'mambalite'])
+@pytest.mark.parametrize('variant', ['original', 'refine', 'multiscale', 'context', 'teacher', 'mambalite', 'bcp', 'few_control'])
 def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, variant):
     """Exercise the real runner loop with a tiny CPU model, including RNG restoration."""
     import sys
@@ -138,7 +138,14 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
             Image.fromarray(image).save(tmp_path / split / 'images' / '{}{}.png'.format(split, index))
             Image.fromarray(mask).save(tmp_path / split / 'masks' / '{}{}.png'.format(split, index))
     manifest_path = tmp_path / 'manifest.json'
-    manifest_path.write_text(json.dumps(make_manifest(tmp_path)))
+    manifest = make_manifest(tmp_path)
+    if variant in ('bcp', 'few_control'):
+        ssl_split = dict(seed=42, labeled=[[PathName.split('/')[-1] for PathName in manifest['train'][0]]],
+                         unlabeled=[[PathName.split('/')[-1] for PathName in manifest['train'][1]]])
+        (tmp_path / 'ssl_split.json').write_text(json.dumps(ssl_split))
+        (tmp_path / manifest['train'][1][1]).unlink()  # Unlabeled GT must not be needed.
+        manifest['train'] = manifest['train'][:1]
+    manifest_path.write_text(json.dumps(manifest))
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(torch.cuda, 'get_device_name', lambda _: 'CPU test double')
     monkeypatch.setattr(torch.cuda, 'reset_peak_memory_stats', lambda: None)
@@ -185,6 +192,12 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
         return result
 
     monkeypatch.setattr(runtime, 'build_model', build)
+    if variant in ('bcp', 'few_control'):
+        import hashlib
+        source_path = tmp_path / 'baseline.pth'
+        torch.save(dict(model_state_dict=build().state_dict(), config=dict(
+            model='vmunet', decoder='original', seed=42, size=32, preprocessing='corrected',
+            manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest())), source_path)
     if variant == 'teacher':
         # Exercise the real runner with a small teacher; real B0 loading is tested separately.
         import copy
@@ -207,15 +220,22 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
     monkeypatch.setattr(torch.utils.data, 'DataLoader', lambda *a, **kw: DataLoader(
         *a, **dict(kw, pin_memory=False)))
 
-    def run(name, resume=False):
+    def run(name, resume=False, expected_initial=None):
         monkeypatch.setattr(sys, 'argv', ['train_full.py', '--data-path', str(tmp_path),
             '--manifest', str(manifest_path), '--output', str(tmp_path / name),
             '--epochs', '2', '--batch-size', '2', '--size', '32'] +
             ['--decoder', decoder, '--model', 'mambalite' if variant == 'mambalite' else 'vmunet'] + (['--output-refine'] if output_refine else []) +
             (['--init-checkpoint', str(source_path), '--teacher-weight', '1'] if variant == 'teacher' else []) +
+            (['--init-checkpoint', str(source_path), '--unlabeled-split', str(tmp_path / 'ssl_split.json')] if variant in ('bcp', 'few_control') else []) +
+            (['--bcp'] if variant == 'bcp' else []) +
+            (['--expected-initial-dice', str(expected_initial)] if expected_initial is not None else []) +
             (['--resume'] if resume else []))
         train_full.main()
 
+    if variant == 'few_control':
+        with pytest.raises(ValueError, match='Initial Dice mismatch'):
+            run('bad_initial', expected_initial=1.0)
+        assert not (tmp_path / 'bad_initial/latest.pth').exists()
     run('continuous')
     original_save = runtime.atomic_save
 
@@ -241,6 +261,10 @@ def test_training_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch, varian
         assert torch.equal(continuous['model_state_dict'][key], resumed['model_state_dict'][key])
     assert continuous['best_dice'] == resumed['best_dice']
     assert len(resumed['history']) == 2
+    if variant == 'bcp':
+        for key, value in continuous['teacher_state_dict'].items():
+            assert torch.equal(value, resumed['teacher_state_dict'][key])
+        assert continuous['history'][-1]['optimizer_updates'] == 2
 
 
 def test_teacher_mask_and_gradients():

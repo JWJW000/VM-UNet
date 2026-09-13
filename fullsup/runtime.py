@@ -36,8 +36,12 @@ class SegmentationDataset(Dataset):
         image_name, mask_name = self.pairs[index]
         with Image.open(self.root / image_name) as im:
             image = np.array(im.convert('RGB'), dtype=np.float64)
-        with Image.open(self.root / mask_name) as im:
-            mask = np.array(im.convert('L'), dtype=np.float64) / 255.0
+        if mask_name is None:
+            # Image-only SSL input: geometry uses a dummy mask, never hidden GT.
+            mask = np.zeros(image.shape[:2], dtype=np.float64)
+        else:
+            with Image.open(self.root / mask_name) as im:
+                mask = np.array(im.convert('L'), dtype=np.float64) / 255.0
         if image.shape[:2] != mask.shape:
             raise ValueError('Image/mask dimensions differ: ' + image_name)
         # Algebraically identical to original myNormalize (its affine stats cancel).
