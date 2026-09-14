@@ -6,7 +6,7 @@ Image Segmentation". {[Arxiv Paper](https://arxiv.org/abs/2402.02491)}
 
 MambaLiteUNet 已放弃，旧扫描半监督队列停止扩展。当前保留VM-UNet，复用Dice=86.9841%的少标注监督权重，对比纯监督继续训练与BCP双向区域混合。
 
-[完整方案与部署命令](docs/BCP少标注验证方案.md) · [监控智能体执行入口](docs/GPU后续执行计划.md) · [最新结果核对](docs/SSL结果核对与下一步_2026-09-13.md)
+[本轮方案与部署命令](docs/BCP少标注验证方案.md) · [后续实验与租赁预算](docs/GPU后续执行计划.md) · [研究路线与历史结论](docs/后续研究路线.md) · [结果核对](docs/SSL结果核对与下一步_2026-09-13.md)
 
 准备好固定权重、manifest和SSL split后，在原CUDA/Mamba环境执行：
 
@@ -17,6 +17,8 @@ tail -f bcp10.log
 ```
 
 服务器存在未提交代码时，按方案建立独立目录，不直接覆盖。脚本先检查指纹、复现初始Dice及CUDA烟测，再分别运行两组1800次更新，最后评估并汇总；任何阶段失败就停止后续阶段。39项CPU测试通过，尚未在GPU证明适配效果。
+
+2026-09-14 后续安排：本轮达标后先做有标注图混合对照，再根据结果补训练种子43、44。RTX 3090 24GB可先预留12小时；各阶段均满足条件时，累计训练预算约24～32小时。后续两阶段仍需实现、检查和独立启动，当前脚本不会自动执行；准备代码、等待和重新配置环境的时间不包含在训练估算中。
 
 ## Abstract
 In the realm of medical image segmentation, both CNN-based and Transformer-based models have been extensively explored. However, CNNs exhibit limitations in long-range modeling capabilities, whereas Transformers are hampered by their quadratic computational complexity. Recently, State Space Models (SSMs), exemplified by Mamba, have emerged as a promising approach. They not only excel in modeling long-range interactions but also maintain a linear computational complexity. In this paper, leveraging state space models, we propose a U-shape architecture model for medical image segmentation, named Vision Mamba UNet (VM-UNet). Specifically, the Visual State Space (VSS) block is introduced as the foundation block to capture extensive contextual information, and an asymmetrical encoder-decoder structure is constructed. We conduct comprehensive experiments on the ISIC17, ISIC18, and Synapse datasets, and the results indicate that VM-UNet performs competitively in medical image segmentation tasks. To our best knowledge, this is the first medical image segmentation model constructed based on the pure SSM-based model. We aim to establish a baseline and provide valuable insights for the future development of more efficient and effective SSM-based segmentation systems.
@@ -86,43 +88,13 @@ python train.py  # Train and test VM-UNet on the ISIC17 or ISIC18 dataset.
 python train_synapse.py  # Train and test VM-UNet on the Synapse dataset.
 ```
 
-## 3.1 Full-supervision research (current direction)
+## 3.1 Research tools and completed experiments
 
-当前目标是在相同全标注条件下改善 VM-UNet。执行流程与实验协议见 **[docs/后续研究路线.md](docs/后续研究路线.md)**。
+`train_full.py` records per-epoch metrics, selects checkpoints by validation pooled Dice, and supports explicit `--resume`. `analyze_full.py` exports per-image Dice/IoU, boundary F1, HD95 in resized-grid pixels, size groups, and failure panels. Validation scores are development results, not independent test results.
 
-```bash
-# Freeze the existing development split; no torch/GPU required
-python prepare_full_split.py --data-path data/isic2018 --output splits/full_isic18_legacy.json
+The completed fully supervised baseline scored **89.53% ± 0.57%** across three seeds; fixed boundary weighting scored **89.50% ± 0.62%**. Context/teacher continuation experiments are complete, and MambaLiteUNet has been abandoned. Their results are summarized in the [research record](docs/后续研究路线.md); they are not queued for further training. Historical model/checkpoint support remains in the code.
 
-# Diagnose an existing trusted baseline checkpoint
-python analyze_full.py --ckpt PATH_TO_BEST.pth --data-path data/isic2018 \
-  --manifest splits/full_isic18_legacy.json --preprocessing legacy \
-  --output results/diagnosis_baseline --gpu 0
-
-# Controlled fully supervised baseline (all training labels used)
-python train_full.py --data-path data/isic2018 --manifest splits/full_isic18_legacy.json \
-  --output results/full_b0_s42 --seed 42 --gpu 0
-
-python -m pytest -q tests
-```
-
-`train_full.py` records per-epoch metrics, selects checkpoints by validation pooled Dice, and supports explicit `--resume`. `analyze_full.py` exports per-image Dice/IoU, boundary F1, HD95 in resized-grid pixels, size groups, and failure panels. See the roadmap for empty-mask conventions and protocol differences from the original runner. Validation scores are not independent test results.
-
-The completed three-seed baseline scored **89.53% ± 0.57%** validation pooled Dice; fixed boundary weighting scored **89.50% ± 0.62%**, so that probe is paused.
-
-Next experiment: **B0-initialized context model without a teacher**. Completed seed43 R4 reached 90.1126% validation Dice versus the B0 continuation control's retained initial 89.9648%. The small gain occurred in only one of 100 epochs, and boundary F1 decreased. This control isolates the teacher's incremental effect under the same initialization and training settings.
-
-```bash
-python train_full.py --data-path data/isic2018 \
-  --manifest splits/full_isic18_legacy.json --output results/full_context_continue_s43 \
-  --init-checkpoint results/full_b0_s43/best.pth --decoder context \
-  --teacher-weight 0 --teacher-confidence 0.9 --seed 43 \
-  --epochs 100 --batch-size 32 --lr 0.0001 --gpu 0
-```
-
-Teacher weight zero already disables teacher construction and inference. Reuse the two completed controls; do not retrain them. See [roadmap section 5.2](docs/后续研究路线.md#52-下一步-b0-初始化的-r3-无教师对照) for results, analysis and resume instructions. All three groups retain epoch-zero best predictions, which must not be counted as a new gain.
-
-The earlier scan-aware semi-supervised scripts (`train_ssl.py`, `eval_cross_domain.py`) remain available as historical experiments. Their direction is paused; see the [archived plan](docs/archive/扫描半监督路线_已暂停.md).
+The earlier scan-aware semi-supervised scripts (`train_ssl.py`, `eval_cross_domain.py`) remain available as historical experiments. Their direction is paused; the [archived plan](docs/archive/扫描半监督路线_已暂停.md) is not an execution queue.
 
 **NOTE**: If you want to use the trained checkpoint for inference testing only and save the corresponding test images, you can follow these steps:
 
@@ -144,5 +116,4 @@ The earlier scan-aware semi-supervised scripts (`train_ssl.py`, `eval_cross_doma
 ## 6. Acknowledgments
 
 - We thank the authors of [VMamba](https://github.com/MzeroMiko/VMamba) and [Swin-UNet](https://github.com/HuCaoFighting/Swin-Unet) for their open-source codes.
-
 
